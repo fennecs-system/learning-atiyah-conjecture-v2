@@ -14,6 +14,8 @@ Changes from minGPT:
   difference at the scale that we operate on here.
 """
 
+import einops
+
 import os
 import sys
 import time
@@ -104,29 +106,40 @@ class CausalSelfAttention(nn.Module):
             x.size()
         )  # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # use einops to move around the head dimension
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
+        # split the last dimension into 3 (q, k, v), then into (nh, hs)
+        q, k, v = einops.rearrange(
+            self.c_attn(x),
+            "B T (three embed) -> three B T embed",
+            three=3,
+            embed=self.n_embd,
+        )
+
+        k = einops.rearrange(
+            k, "B T (nh hs) -> B nh T hs", nh=self.n_head, hs=C // self.n_head
+        )
+        q = einops.rearrange(
+            q, "B T (nh hs) -> B nh T hs", nh=self.n_head, hs=C // self.n_head
+        )
+        v = einops.rearrange(
+            v, "B T (nh hs) -> B nh T hs", nh=self.n_head, hs=C // self.n_head
+        )
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # use a bert style instead of a gpt style mask
 
+        # swap the last two dimensions of k
+        k = einops.rearrange(k, "B nh T hs -> B nh hs T")
+        att = (q @ k) * (1.0 / math.sqrt(k.size(-2)))
+
+        # use a bert style instead of a gpt style mask
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
         att = F.softmax(att, dim=-1)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
+
+        # transpose
+        y = einops.rearrange(y, "B nh T hs -> B T (nh hs)")
 
         # output projection
         y = self.c_proj(y)
