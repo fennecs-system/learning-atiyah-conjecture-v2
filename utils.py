@@ -1,4 +1,4 @@
-from .poly import PolyM
+from poly import PolyM
 from functools import reduce
 from random import choice
 
@@ -89,18 +89,18 @@ def encode(p, v, k):
         if x < 0:
             x *= -1
             encoded.append(SIGN_TOKEN)
-        encoded.append(int(x * 100)+1)
+        encoded.append(int(x * 100) + 1)
         if y < 0:
             y *= -1
             encoded.append(SIGN_TOKEN)
-        encoded.append(int(y * 100)+1)
+        encoded.append(int(y * 100) + 1)
     encoded.append(END_BLOCK_TOKEN)
     for j in range(n):
         vk = v[j]
         if vk < 0:
             vk *= -1
             encoded.append(SIGN_TOKEN)
-        encoded.append(int(vk * 100)+1)
+        encoded.append(int(vk * 100) + 1)
     encoded.append(END_BLOCK_TOKEN)
     encoded.append(k + CLASS_START)
     return encoded
@@ -165,7 +165,7 @@ def decode(encoded):
     return p_tensor, v_tensor, k
 
 
-def compute_max_dot(p,v):
+def compute_max_dot(p, v):
     # in general n points
     n_points = 4
     dots = empty(n_points)
@@ -208,3 +208,15 @@ def compute_max_dot(p,v):
     # coeff_tensors.append(coeffs)
     return dots, max_index.item()
 
+
+def decode_and_check(input):
+    # there should be p, v and a k
+    # p is 2 n ints, v is n ints, k is 1 int
+    p, v, k_out = decode(input)
+    dots, k_eval = compute_max_dot(p, v)
+    print(f"Predicted {k_out}, found {int(k_eval)} from computing dot of predicted")
+    if abs(int(k_eval) - int(k_out)) < 0.001:
+        return True
+    else:
+        return False
+    #
