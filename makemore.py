@@ -43,8 +43,7 @@ class ModelConfig:
     vocab_size: int = None  # the input integers are in range [0 .. vocab_size -1]
     # parameters below control the sizes of each model slightly differently
     n_layer: int = 4
-    n_embd: int = 64
-    n_embd2: int = 64
+    n_embd: int = 64  # refers to the total for the multi-head attention so must be divisible by n_head
     n_head: int = 4
 
 
@@ -130,13 +129,19 @@ class CausalSelfAttention(nn.Module):
 
         # swap the last two dimensions of k
         k = einops.rearrange(k, "B nh T hs -> B nh hs T")
-        att = (q @ k) * (1.0 / math.sqrt(k.size(-2)))
 
-        # use a bert style instead of a gpt style mask
+        # T = S
+        att = einops.einsum(q, k, "B nh T hs, B nh hs S -> B nh T S") * (
+            1.0 / math.sqrt(k.size(-2))
+        )
+
+        # gpt style
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
         att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = einops.einsum(att, v, "B nh T T, B nh T hs -> B nh T hs")
 
         # transpose
         y = einops.rearrange(y, "B nh T hs -> B T (nh hs)")
@@ -577,7 +582,6 @@ if __name__ == "__main__":
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
-        n_embd2=args.n_embd2,
     )
 
     model = Transformer(config)

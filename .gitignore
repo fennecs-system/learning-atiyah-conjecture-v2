@@ -6,4 +6,4 @@ out/
 __pycache__/
 woof/
 out/
-.ruff_cache/ 
+.ruff_cache/
