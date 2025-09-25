@@ -40,15 +40,14 @@ from dataset_utils import create_datasets, create_fused_datasets, StreamDataLoad
 
 # -----------------------------------------------------------------------------
 
+
 def warmup_lambda(step):
     warmup_steps = 500
     if step < warmup_steps:
         return step / warmup_steps
-    
-    if step > 1000: 
-        # half the learning rate 
-        return 0.5
+
     return 1.0
+
 
 @dataclass
 class ModelConfig:
@@ -190,6 +189,9 @@ def check_sample_valid(word):
         # assert that at least 50% are non zero
         assert sum(1 for x in p_ints if x != 0) >= 0.5 * len(p_ints)
 
+        # assert that the p ints cant be all the same, possibly removing 102
+        assert len(set(p_ints) - {102}) > 1
+
         # assert at most 16 tokens for p (one token for sign, one for value)
         assert len(p_ints) <= 2 * n * dim
 
@@ -210,7 +212,6 @@ def check_sample_valid(word):
 
 
 def generate_n_improved_samples(num=1000, generation=1):
-
     def process_sample(i: int, X_samp) -> Optional[Tuple[int, str]]:
         """Process a single sample and return result if valid improvement found."""
         try:
@@ -259,13 +260,12 @@ def generate_n_improved_samples(num=1000, generation=1):
     # repeat until we have num such samples
     num_found = 0
     out_path = os.path.join(run_dir, f"data_generation-{generation}.txt")
-    
-    write_batch_num = 10 
+
+    write_batch_num = 10
     current_write_batch = 0
 
     with open(out_path, "w") as f:
         while num_found < num:
-
             write_batch_str = ""
 
             # seed 100 random samples
@@ -332,7 +332,20 @@ def generate_n_improved_samples(num=1000, generation=1):
         f"Generation {generation} complete: {num_found} improved samples saved to {out_path}"
     )
 
-def train_one_batch(model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args, total_batches, best_loss, step):
+
+def train_one_batch(
+    model,
+    optimizer,
+    scheduler,
+    batch_loader,
+    out_path,
+    sample_step,
+    generation,
+    args,
+    total_batches,
+    best_loss,
+    step,
+):
     t0 = time.time()
     # get the next batch, ship to device, and unpack it to input and target
     batch = batch_loader.next()
@@ -367,19 +380,13 @@ def train_one_batch(model, optimizer, scheduler, batch_loader, out_path, sample_
         test_loss, train_acc = evaluate(
             model, test_dataset, batch_size=100, max_batches=10
         )
-        writer.add_scalar(
-            "Loss/train", train_loss, step + generation * total_batches
-        )
-        writer.add_scalar(
-            "Loss/test", test_loss, step + generation * total_batches
-        )
+        writer.add_scalar("Loss/train", train_loss, step + generation * total_batches)
+        writer.add_scalar("Loss/test", test_loss, step + generation * total_batches)
 
         writer.add_scalar(
             "Accuracy/train", train_acc, step + generation * total_batches
         )
-        writer.add_scalar(
-            "Accuracy/test", train_acc, step + generation * total_batches
-        )
+        writer.add_scalar("Accuracy/test", train_acc, step + generation * total_batches)
 
         # accuracy
 
@@ -394,12 +401,11 @@ def train_one_batch(model, optimizer, scheduler, batch_loader, out_path, sample_
             # save the step count too
             # make it atomic
             state_dict = {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "step": step,
-                    "best_loss": best_loss,
-                }
-
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "step": step,
+                "best_loss": best_loss,
+            }
 
             # first generation, dont save generation number
             if generation > 0:
@@ -431,8 +437,20 @@ def train_one_epoch(
     print(f"Starting generation {generation} with {total_batches} batches")
 
     while True:
-        try: 
-            train_one_batch(model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args, total_batches, best_loss, step)
+        try:
+            train_one_batch(
+                model,
+                optimizer,
+                scheduler,
+                batch_loader,
+                out_path,
+                sample_step,
+                generation,
+                args,
+                total_batches,
+                best_loss,
+                step,
+            )
             step += 1
         except Exception as e:
             print(e)
@@ -484,7 +502,7 @@ if __name__ == "__main__":
     # 3 - can be improved by local search
     # we collect 10000 such samples every boost iteration
 
-    max_pattern_boost_steps = 5
+    max_pattern_boost_steps = 30
 
     # parse command line args
     parser = argparse.ArgumentParser(description="Learning Atiyah Conjecture")
@@ -559,7 +577,7 @@ if __name__ == "__main__":
         "--batch-size",
         "-b",
         type=int,
-        default=32,
+        default=64,
         help="batch size during optimization",
     )
     parser.add_argument(
@@ -648,11 +666,10 @@ if __name__ == "__main__":
     )
 
     model = Transformer(config)
-    model = torch.compile(model)
+    # model = torch.compile(model)
     model.to(args.device)
 
-    # compile model 
-
+    # compile model
 
     batch_size = args.batch_size
 

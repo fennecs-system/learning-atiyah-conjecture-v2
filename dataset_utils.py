@@ -50,7 +50,8 @@ class StreamDataLoader:
 
     def __init__(self, dataset, **kwargs):
         train_sampler = torch.utils.data.RandomSampler(
-            dataset, replacement=False, #num_samples=int(1e10)
+            dataset,
+            replacement=False,  # num_samples=int(1e10)
         )
         self.train_loader = DataLoader(dataset, sampler=train_sampler, **kwargs)
         self.data_iter = iter(self.train_loader)
@@ -90,6 +91,9 @@ def create_datasets(input_file):
         f"split up the dataset into {len(train_words)} training examples and {len(test_words)} test examples"
     )
 
+    # up
+    max_word_length = 256
+
     # wrap in dataset objects
     train_dataset = CharDataset(train_words, chars, max_word_length)
     test_dataset = CharDataset(test_words, chars, max_word_length)
@@ -117,7 +121,7 @@ def create_fused_datasets(seed_dataset_file, additional_dataset_files):
         words = data.splitlines()
         words = [w.strip() for w in words]  # get rid of any leading
         words = [w for w in words if w]  # get rid of any empty strings
-        
+
         # there might be longer words because of minus signs etc
         max_word_length = max(len(w) for w in words)
 
@@ -126,6 +130,9 @@ def create_fused_datasets(seed_dataset_file, additional_dataset_files):
     # randomly shuffle the total words
 
     random.shuffle(total_words)
+
+    # up
+    max_word_length = 256
 
     print(f"number of examples in the fused dataset: {len(total_words)}")
 
