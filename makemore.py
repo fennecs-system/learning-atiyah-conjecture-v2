@@ -27,7 +27,6 @@ import time
 
 from typing import Optional, Tuple
 
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
@@ -202,9 +201,8 @@ def check_sample_valid(word):
 
 
 def generate_n_improved_samples(num=1000, generation=1):
-    write_lock = threading.Lock()
 
-    def process_sample(i: int, X_samp, f) -> Optional[Tuple[int, str]]:
+    def process_sample(i: int, X_samp) -> Optional[Tuple[int, str]]:
         """Process a single sample and return result if valid improvement found."""
         try:
             # get the i'th row of sampled integers, as python list
@@ -234,10 +232,7 @@ def generate_n_improved_samples(num=1000, generation=1):
                         tokens_str = ",".join([str(x) for x in tokens]) + "\n"
 
                         # Thread-safe file writing
-                        with write_lock:
-                            print(f"Found improved sample {tokens}")
-                            f.write(tokens_str)
-                            f.flush()  # Ensure immediate write
+                        print(f"Found improved sample {tokens}")
 
                         return (i, tokens_str)
 
@@ -255,9 +250,15 @@ def generate_n_improved_samples(num=1000, generation=1):
     # repeat until we have num such samples
     num_found = 0
     out_path = os.path.join(run_dir, f"data_generation-{generation}.txt")
+    
+    write_batch_num = 10 
+    current_write_batch = 0
 
     with open(out_path, "w") as f:
         while num_found < num:
+
+            write_batch_str = ""
+
             # seed 100 random samples
             X_init = torch.zeros(100, 1, dtype=torch.long).to(args.device)
             top_k = args.top_k if args.top_k != -1 else None
@@ -275,7 +276,7 @@ def generate_n_improved_samples(num=1000, generation=1):
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks for this batch
                 futures = {
-                    executor.submit(process_sample, i, X_samp, f): i
+                    executor.submit(process_sample, i, X_samp): i
                     for i in range(X_samp.size(0))
                 }
 
@@ -283,6 +284,17 @@ def generate_n_improved_samples(num=1000, generation=1):
                 for future in as_completed(futures):
                     result = future.result()
                     if result is not None:
+                        i, tokens_str = result
+
+                        write_batch_str += tokens_str
+
+                        if current_write_batch >= write_batch_num:
+                            f.write(write_batch_str)
+                            f.flush()
+                            write_batch_str = ""
+                            current_write_batch = 0
+
+                        current_write_batch += 1
                         batch_found += 1
                         num_found += 1
 
@@ -292,6 +304,11 @@ def generate_n_improved_samples(num=1000, generation=1):
                             for remaining_future in futures:
                                 if not remaining_future.done():
                                     remaining_future.cancel()
+
+                            # flush any remaining write batch
+                            if write_batch_str != "":
+                                f.write(write_batch_str)
+                                f.flush()
                             break
 
             print(
@@ -674,6 +691,8 @@ if __name__ == "__main__":
 
         print(f"finished generation {generation}, generating new samples")
 
+        # set model to
+        model.eval()
         # save in generation+1, since we take initial dataset as generation 0
         generate_n_improved_samples(num=10000, generation=generation + 1)
 
@@ -699,3 +718,6 @@ if __name__ == "__main__":
             pin_memory=True,
             num_workers=args.num_workers,
         )
+
+        # set model back to train mode
+        model.train()
