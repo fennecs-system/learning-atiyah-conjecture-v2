@@ -92,7 +92,7 @@ def create_datasets(input_file):
     )
 
     # up
-    max_word_length = 256
+    max_word_length = 144
 
     # wrap in dataset objects
     train_dataset = CharDataset(train_words, chars, max_word_length)
@@ -132,7 +132,7 @@ def create_fused_datasets(seed_dataset_file, additional_dataset_files):
     random.shuffle(total_words)
 
     # up
-    max_word_length = 256
+    max_word_length = 144
 
     print(f"number of examples in the fused dataset: {len(total_words)}")
 
