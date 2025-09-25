@@ -14,7 +14,6 @@ Changes from minGPT:
   difference at the scale that we operate on here.
 """
 
-
 import os
 import sys
 import time
@@ -39,8 +38,8 @@ from dataset_utils import create_datasets, create_fused_datasets, InfiniteDataLo
 
 @dataclass
 class ModelConfig:
-    block_size: int = None  # length of the input sequences of integers
-    vocab_size: int = None  # the input integers are in range [0 .. vocab_size -1]
+    block_size: int | None = None  # length of the input sequences of integers
+    vocab_size: int | None = None  # the input integers are in range [0 .. vocab_size -1]
     # parameters below control the sizes of each model slightly differently
     n_layer: int = 4
     n_embd: int = 512  # refers to the total for the multi-head attention so must be divisible by n_head
@@ -144,34 +143,35 @@ def print_samples(num=10):
     print("-" * 80)
     return num_new_correct, len(new_samples)
 
+
 # a sample must be grammatically correct
 def check_sample_valid(word):
-    # 4 points, in R^2 
+    # 4 points, in R^2
     n = 4
-    dim = 2 
+    dim = 2
 
     try:
         ints = [int(x.strip()) for x in word.split(",") if x.strip()]
 
-        # assert the first four tokens before the stop token 103 - eg the v 
-        # is less than 102  -- allowing for sign 
+        # assert the first four tokens before the stop token 103 - eg the v
+        # is less than 102  -- allowing for sign
         it = iter(ints)
-        v_ints = list(takewhile(lambda x : x < 103, it))
+        v_ints = list(takewhile(lambda x: x < 103, it))
         assert all(x < 103 for x in v_ints)
 
         # assert at most 8 tokens for v (one token for sign, one for value)
-        assert len(v_ints) <= 2 * n 
+        assert len(v_ints) <= 2 * n
 
         # check that the next block of tokens before the stop token 103
-        # take everything after the head 
+        # take everything after the head
         it = list(it)[1:]
-        p_ints = list(takewhile(lambda x : x < 103, it))
+        p_ints = list(takewhile(lambda x: x < 103, it))
 
         assert all(x < 103 for x in p_ints)
         # assert not all zeros for p
         assert not all(x == 0 for x in p_ints)
 
-        # assert that at least 80% are non zero 
+        # assert that at least 80% are non zero
         assert sum(1 for x in p_ints if x != 0) >= 0.8 * len(p_ints)
 
         # assert at most 16 tokens for p (one token for sign, one for value)
@@ -182,11 +182,11 @@ def check_sample_valid(word):
         # k should be a valid index
         assert k >= 0 and k < len(v)
 
-        # assert k should be 1 x 4 
+        # assert k should be 1 x 4
         assert v.shape == (n,)
-        # p should be 4 x 2 
+        # p should be 4 x 2
         # two points in 2D for each of the 4 vertices
-        assert p.shape == (n,dim)
+        assert p.shape == (n, dim)
 
         return v, p, k
     except Exception as e:
@@ -203,12 +203,14 @@ def generate_n_improved_samples(num=1000, generation=1):
     with open(out_path, "w") as f:
         while num_found < num:
             # seed 100 random samples
-            X_init = torch.zeros(100, 1, dtype=torch.long).to(args.device)
+            X_init = torch.zeros(1000, 1, dtype=torch.long).to(args.device)
             top_k = args.top_k if args.top_k != -1 else None
             steps = (
                 train_dataset.get_output_length() - 1
             )  # -1 because we already start with <START> token (index 0)
-            X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to("cpu")
+            X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to(
+                "cpu"
+            )
             for i in range(X_samp.size(0)):
                 # get the i'th row of sampled integers, as python list
                 row = X_samp[
@@ -245,7 +247,9 @@ def generate_n_improved_samples(num=1000, generation=1):
         # write all examples to data_generation.txt
 
 
-def train_one_generation(model, optimizer, batch_loader, out_path, sample_step, generation, args):
+def train_one_generation(
+    model, optimizer, batch_loader, out_path, sample_step, generation, args
+):
     best_loss = None
     step = 0
 
@@ -284,11 +288,19 @@ def train_one_generation(model, optimizer, batch_loader, out_path, sample_step, 
             test_loss, train_acc = evaluate(
                 model, test_dataset, batch_size=100, max_batches=10
             )
-            writer.add_scalar("Loss/train", train_loss, step)
-            writer.add_scalar("Loss/test", test_loss, step)
+            writer.add_scalar(
+                "Loss/train", train_loss, step + generation * args.max_steps
+            )
+            writer.add_scalar(
+                "Loss/test", test_loss, step + generation * args.max_steps
+            )
 
-            writer.add_scalar("Accuracy/train", train_acc, step)
-            writer.add_scalar("Accuracy/test", train_acc, step)
+            writer.add_scalar(
+                "Accuracy/train", train_acc, step + generation * args.max_steps
+            )
+            writer.add_scalar(
+                "Accuracy/test", train_acc, step + generation * args.max_steps
+            )
 
             # accuracy
 
@@ -302,14 +314,16 @@ def train_one_generation(model, optimizer, batch_loader, out_path, sample_step, 
 
                 # save the step count too
                 # make it atomic
-                state_dict = {
+                state_dict = (
+                    {
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "step": step,
                         "best_loss": best_loss,
                     },
+                )
 
-                # first generation, dont save generation numberC
+                # first generation, dont save generation number
                 if generation > 0:
                     state_dict["generation"] = generation
 
@@ -323,7 +337,11 @@ def train_one_generation(model, optimizer, batch_loader, out_path, sample_step, 
         # sample from the model
         if step > 0 and step % sample_step == 0:
             num_correct, num_samples = print_samples(num=10)
-            writer.add_scalar("Sampling/new_correct", num_correct / num_samples, step)
+            writer.add_scalar(
+                "Sampling/new_correct",
+                num_correct / num_samples,
+                step + generation * args.max_steps,
+            )
 
         step += 1
         # termination conditions
@@ -563,7 +581,7 @@ if __name__ == "__main__":
     )
 
     print(f"model #params: {sum(p.numel() for p in model.parameters())}")
-    
+
     # if there is a loaded model, load it
     if loaded is not None:
         print(f"resuming from existing model in the workdir {out_path}")
@@ -594,22 +612,23 @@ if __name__ == "__main__":
         print(f"finished generation {generation}, generating new samples")
 
         # save in generation+1, since we take initial dataset as generation 0
-        generate_n_improved_samples(num=10000, generation=generation+1) 
-        
+        generate_n_improved_samples(num=10000, generation=generation + 1)
+
         # rebuild the dataloaders with the new data
         all_other_data_files = []
 
         for gen in range(1, generation + 2):
             gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
-            if os.path.exists(gen_file): 
+            if os.path.exists(gen_file):
                 all_other_data_files.append(gen_file)
 
         print(
-            f"loading fused dataset from {len(all_other_data_files)} files, up to generation {generation+1}"
+            f"loading fused dataset from {len(all_other_data_files)} files, up to generation {generation + 1}"
         )
+        generation_zero = args.input_file
 
         train_dataset, test_dataset = create_fused_datasets(
-                generation_zero, all_other_data_files
+            generation_zero, all_other_data_files
         )
         batch_loader = InfiniteDataLoader(
             train_dataset,

@@ -232,16 +232,17 @@ def decode_and_check(input):
 # or doesnt become too close
 def repulsion_loss(p, min_distance=0.01):
     n_points = p.shape[0]
-
+    eps = 1e-5
     diff = p.unsqueeze(1) - p.unsqueeze(0)
     distances = torch.linalg.vector_norm(diff, dim=2)
 
     # Adaptive epsilon based on minimum desired distance
     eps = min_distance / 10.0
+
     distances = torch.clamp(distances, min=eps)
 
     mask = torch.triu(torch.ones(n_points, n_points), diagonal=1).bool()
-    forces = 1.0 / (distances**2)
+    forces = 1.0 / (distances.pow(2) + eps)
     total_force = forces[mask].sum()
 
     return 0.0001 * total_force

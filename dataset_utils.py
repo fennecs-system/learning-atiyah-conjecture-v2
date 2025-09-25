@@ -118,11 +118,11 @@ def create_fused_datasets(seed_dataset_file, additional_dataset_files):
         words = [w.strip() for w in words]  # get rid of any leading
         words = [w for w in words if w]  # get rid of any empty strings
 
-        total_words += words
+        total_words = total_words + words
 
     # randomly shuffle the total words
 
-    total_words = random.shuffle(total_words)
+    random.shuffle(total_words)
 
     test_set_size = min(
         1000, int(len(total_words) * 0.1)
