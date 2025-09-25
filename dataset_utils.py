@@ -42,7 +42,7 @@ class CharDataset(Dataset):
         return x, y
 
 
-class InfiniteDataLoader:
+class StreamDataLoader:
     """
     this is really hacky and I'm not proud of it, but there doesn't seem to be
     a better way in PyTorch to just create an infinite dataloader?
@@ -50,7 +50,7 @@ class InfiniteDataLoader:
 
     def __init__(self, dataset, **kwargs):
         train_sampler = torch.utils.data.RandomSampler(
-            dataset, replacement=True, num_samples=int(1e10)
+            dataset, replacement=False, #num_samples=int(1e10)
         )
         self.train_loader = DataLoader(dataset, sampler=train_sampler, **kwargs)
         self.data_iter = iter(self.train_loader)
@@ -117,6 +117,9 @@ def create_fused_datasets(seed_dataset_file, additional_dataset_files):
         words = data.splitlines()
         words = [w.strip() for w in words]  # get rid of any leading
         words = [w for w in words if w]  # get rid of any empty strings
+        
+        # there might be longer words because of minus signs etc
+        max_word_length = max(len(w) for w in words)
 
         total_words = total_words + words
 

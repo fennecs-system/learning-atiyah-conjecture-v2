@@ -36,10 +36,19 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from model import Transformer
-from dataset_utils import create_datasets, create_fused_datasets, InfiniteDataLoader
+from dataset_utils import create_datasets, create_fused_datasets, StreamDataLoader
 
 # -----------------------------------------------------------------------------
 
+def warmup_lambda(step):
+    warmup_steps = 500
+    if step < warmup_steps:
+        return step / warmup_steps
+    
+    if step > 1000: 
+        # half the learning rate 
+        return 0.5
+    return 1.0
 
 @dataclass
 class ModelConfig:
@@ -178,8 +187,8 @@ def check_sample_valid(word):
         # assert not all zeros for p
         assert not all(x == 0 for x in p_ints)
 
-        # assert that at least 80% are non zero
-        assert sum(1 for x in p_ints if x != 0) >= 0.8 * len(p_ints)
+        # assert that at least 50% are non zero
+        assert sum(1 for x in p_ints if x != 0) >= 0.5 * len(p_ints)
 
         # assert at most 16 tokens for p (one token for sign, one for value)
         assert len(p_ints) <= 2 * n * dim
@@ -287,6 +296,7 @@ def generate_n_improved_samples(num=1000, generation=1):
                         i, tokens_str = result
 
                         write_batch_str += tokens_str
+                        current_write_batch += 1
 
                         if current_write_batch >= write_batch_num:
                             f.write(write_batch_str)
@@ -294,7 +304,6 @@ def generate_n_improved_samples(num=1000, generation=1):
                             write_batch_str = ""
                             current_write_batch = 0
 
-                        current_write_batch += 1
                         batch_found += 1
                         num_found += 1
 
@@ -315,9 +324,6 @@ def generate_n_improved_samples(num=1000, generation=1):
                 f"Batch complete: found {batch_found} new samples. Total: {num_found}/{num}"
             )
 
-            # clear the torch cache
-            gc.collect()
-
             # Break if we've found enough samples
             if num_found >= num:
                 break
@@ -326,107 +332,116 @@ def generate_n_improved_samples(num=1000, generation=1):
         f"Generation {generation} complete: {num_found} improved samples saved to {out_path}"
     )
 
+def train_one_batch(model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args, total_batches, best_loss, step):
+    t0 = time.time()
+    # get the next batch, ship to device, and unpack it to input and target
+    batch = batch_loader.next()
+    batch = [t.to(args.device) for t in batch]
+    X, Y = batch
 
-def train_one_generation(
-    model, optimizer, batch_loader, out_path, sample_step, generation, args
+    # feed into the model
+    logits, loss = model(X, Y)
+
+    # calculate the gradient, update the weights
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    # wait for all CUDA work on the GPU to finish then calculate iteration time taken
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t1 = time.time()
+
+    # logging
+    if step % 10 == 0:
+        print(
+            f"step {step} | loss {loss.item():.4f} | step time {(t1 - t0) * 1000:.2f}ms"
+        )
+
+    # evaluate the model
+    if step > 0 and step % 500 == 0:
+        train_loss, train_acc = evaluate(
+            model, train_dataset, batch_size=100, max_batches=10
+        )
+        test_loss, train_acc = evaluate(
+            model, test_dataset, batch_size=100, max_batches=10
+        )
+        writer.add_scalar(
+            "Loss/train", train_loss, step + generation * total_batches
+        )
+        writer.add_scalar(
+            "Loss/test", test_loss, step + generation * total_batches
+        )
+
+        writer.add_scalar(
+            "Accuracy/train", train_acc, step + generation * total_batches
+        )
+        writer.add_scalar(
+            "Accuracy/test", train_acc, step + generation * total_batches
+        )
+
+        # accuracy
+
+        writer.flush()
+        print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
+        # save the model to disk if it has improved
+        if best_loss is None or test_loss < best_loss:
+            print(
+                f"test loss {test_loss} is the best so far, saving model to {out_path}"
+            )
+
+            # save the step count too
+            # make it atomic
+            state_dict = {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "step": step,
+                    "best_loss": best_loss,
+                }
+
+
+            # first generation, dont save generation number
+            if generation > 0:
+                state_dict["generation"] = generation
+
+            atomic_torch_save(
+                state_dict,
+                out_path,
+            )
+
+            best_loss = test_loss
+
+    # sample from the model
+    if step > 0 and step % sample_step == 0:
+        num_correct, num_samples = print_samples(num=10)
+        writer.add_scalar(
+            "Sampling/new_correct",
+            num_correct / num_samples,
+            step + generation * total_batches,
+        )
+
+
+def train_one_epoch(
+    model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args
 ):
     best_loss = None
     step = 0
+    total_batches = batch_loader.train_loader.__len__()
+    print(f"Starting generation {generation} with {total_batches} batches")
 
     while True:
-        t0 = time.time()
+        try: 
+            train_one_batch(model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args, total_batches, best_loss, step)
+            step += 1
+        except Exception as e:
+            print(e)
 
-        # get the next batch, ship to device, and unpack it to input and target
-        batch = batch_loader.next()
-        batch = [t.to(args.device) for t in batch]
-        X, Y = batch
-
-        # feed into the model
-        logits, loss = model(X, Y)
-
-        # calculate the gradient, update the weights
-        model.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-        # wait for all CUDA work on the GPU to finish then calculate iteration time taken
-        if args.device.startswith("cuda"):
-            torch.cuda.synchronize()
-        t1 = time.time()
-
-        # logging
-        if step % 10 == 0:
-            print(
-                f"step {step} | loss {loss.item():.4f} | step time {(t1 - t0) * 1000:.2f}ms"
-            )
-
-        # evaluate the model
-        if step > 0 and step % 500 == 0:
-            train_loss, train_acc = evaluate(
-                model, train_dataset, batch_size=100, max_batches=10
-            )
-            test_loss, train_acc = evaluate(
-                model, test_dataset, batch_size=100, max_batches=10
-            )
-            writer.add_scalar(
-                "Loss/train", train_loss, step + generation * args.max_steps
-            )
-            writer.add_scalar(
-                "Loss/test", test_loss, step + generation * args.max_steps
-            )
-
-            writer.add_scalar(
-                "Accuracy/train", train_acc, step + generation * args.max_steps
-            )
-            writer.add_scalar(
-                "Accuracy/test", train_acc, step + generation * args.max_steps
-            )
-
-            # accuracy
-
-            writer.flush()
-            print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
-            # save the model to disk if it has improved
-            if best_loss is None or test_loss < best_loss:
-                print(
-                    f"test loss {test_loss} is the best so far, saving model to {out_path}"
-                )
-
-                # save the step count too
-                # make it atomic
-                state_dict = (
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "step": step,
-                        "best_loss": best_loss,
-                    },
-                )
-
-                # first generation, dont save generation number
-                if generation > 0:
-                    state_dict["generation"] = generation
-
-                atomic_torch_save(
-                    state_dict,
-                    out_path,
-                )
-
-                best_loss = test_loss
-
-        # sample from the model
-        if step > 0 and step % sample_step == 0:
-            num_correct, num_samples = print_samples(num=10)
-            writer.add_scalar(
-                "Sampling/new_correct",
-                num_correct / num_samples,
-                step + generation * args.max_steps,
-            )
-
-        step += 1
-        # termination conditions
-        if args.max_steps >= 0 and step >= args.max_steps:
+        if step >= total_batches:
+            print("End of epoch")
             break
+
+        # termination conditions
 
 
 @torch.inference_mode()
@@ -472,7 +487,7 @@ if __name__ == "__main__":
     max_pattern_boost_steps = 5
 
     # parse command line args
-    parser = argparse.ArgumentParser(description="Make More")
+    parser = argparse.ArgumentParser(description="Learning Atiyah Conjecture")
     # system/input/output
     parser.add_argument(
         "--input-file",
@@ -500,12 +515,6 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="number of data workers for both train/test",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=2000,
-        help="max number of optimization steps to run for, or -1 for infinite.",
     )
 
     parser.add_argument(
@@ -639,7 +648,11 @@ if __name__ == "__main__":
     )
 
     model = Transformer(config)
+    model = torch.compile(model)
     model.to(args.device)
+
+    # compile model 
+
 
     batch_size = args.batch_size
 
@@ -652,8 +665,10 @@ if __name__ == "__main__":
         eps=1e-8,
     )
 
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_lambda)
+
     # init dataloader
-    batch_loader = InfiniteDataLoader(
+    batch_loader = StreamDataLoader(
         train_dataset,
         batch_size=batch_size,
         pin_memory=True,
@@ -679,9 +694,10 @@ if __name__ == "__main__":
     # training loop
 
     for generation in range(starting_generation, max_pattern_boost_steps):
-        train_one_generation(
+        train_one_epoch(
             model,
             optimizer,
+            scheduler,
             batch_loader,
             out_path,
             sample_step=500,
@@ -694,7 +710,7 @@ if __name__ == "__main__":
         # set model to
         model.eval()
         # save in generation+1, since we take initial dataset as generation 0
-        generate_n_improved_samples(num=10000, generation=generation + 1)
+        generate_n_improved_samples(num=1000, generation=generation + 1)
 
         # rebuild the dataloaders with the new data
         all_other_data_files = []
@@ -712,7 +728,7 @@ if __name__ == "__main__":
         train_dataset, test_dataset = create_fused_datasets(
             generation_zero, all_other_data_files
         )
-        batch_loader = InfiniteDataLoader(
+        batch_loader = StreamDataLoader(
             train_dataset,
             batch_size=batch_size,
             pin_memory=True,
