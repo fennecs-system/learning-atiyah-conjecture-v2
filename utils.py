@@ -94,7 +94,7 @@ def encode(v, p, k):
             encoded.append(SIGN_TOKEN)
         encoded.append(int(vk * 100) + 1)
     encoded.append(END_BLOCK_TOKEN)
-    
+
     for j in range(n):
         x, y = p[j]
         if x < 0:
@@ -106,7 +106,7 @@ def encode(v, p, k):
             encoded.append(SIGN_TOKEN)
         encoded.append(int(y * 100) + 1)
     encoded.append(END_BLOCK_TOKEN)
-    
+
     encoded.append(k + CLASS_START)
     return encoded
 
@@ -140,7 +140,7 @@ def decode(encoded):
             val *= -1
             is_negative = False
         v.append(val)
-    
+
     # Decode `p` block
     p_block = blocks[1]
     i = 0
@@ -217,32 +217,50 @@ def compute_max_dot(v: Tensor, p: Tensor):
 def decode_and_check(input):
     # there should be p, v and a k
     # p is 2 n ints, v is n ints, k is 1 int
-    v, p, k_out = decode(input)
-    dots, k_eval = compute_max_dot(v, p)
-    print(f"Predicted {k_out}, found {int(k_eval)} from computing dot of predicted")
-    if abs(int(k_eval) - int(k_out)) < 0.001:
-        return True
-    else:
-        return False
+    try:
+        v, p, k_out = decode(input)
+        _dots, k_eval = compute_max_dot(v, p)
+        if abs(int(k_eval) - int(k_out)) < 0.001:
+            return v, p, k_out
+        else:
+            return None
+    except:
+        return None
+
+
+# make sure p doesnt become 0
+# or doesnt become too close
+def repulsion_loss(p, min_distance=0.01):
+    n_points = p.shape[0]
+
+    diff = p.unsqueeze(1) - p.unsqueeze(0)
+    distances = torch.linalg.vector_norm(diff, dim=2)
+
+    # Adaptive epsilon based on minimum desired distance
+    eps = min_distance / 10.0
+    distances = torch.clamp(distances, min=eps)
+
+    mask = torch.triu(torch.ones(n_points, n_points), diagonal=1).bool()
+    forces = 1.0 / (distances**2)
+    total_force = forces[mask].sum()
+
+    return 0.0001 * total_force
 
 
 # p is a list of tuples of coords
 # v is a list of values
 # v, p, k are python tensors
-def local_search(v, p, k):
+def local_search(v, p, k, max_num_steps=20):
     # given a v, p and k,
     # fix a v, and then try to find a better p
     # by local search.
     # k determines the pot product,
 
     best_p = p.clone()
-    best_p_seen = [best_p.clone()]
     best_dots, k_eval = compute_max_dot(v, best_p)
     assert k_eval == k
 
     best_dot_squared = best_dots[k_eval].abs() ** 2
-
-    max_num_steps = 20
 
     # nelder mead coefficients
     alpha = 1.0  # reflection
@@ -251,16 +269,31 @@ def local_search(v, p, k):
     sigma = 0.5  # shrink
 
     step = 0
+
     vertices = [best_p.clone()]
+    best_p_seen = [best_p.clone()]
+
     for _ in range(8):
-        vertices.append(best_p + 0.01 * (rand(best_p.shape) - 0.5))
+        perturbation = 0.01 * (2 * rand(best_p.shape) - 1)
+        new_vertex = best_p + perturbation
+        # clamp to [0.00,0.99]
+        new_vertex = torch.clamp(new_vertex, 0.00, 0.99)
+
+        vertices.append(new_vertex)
+
+    # add an electostatic repulsion loss to keep points apart
+    def objective_function(p_candidate):
+        dots_found, k_found = compute_max_dot(v, p_candidate)
+        return dots_found[k_found].abs() ** 2 + repulsion_loss(p_candidate)
+
+    def clamp(p_candidate):
+        return torch.clamp(p_candidate, 0.00, 0.99)
 
     while True:
         step += 1
 
         # order (ascending for minimization)
-        vertex_dots = [compute_max_dot(v, vtx) for vtx in vertices]
-        vertex_dot_values = [dots[k].abs() ** 2 for dots, k in vertex_dots]
+        vertex_dot_values = [objective_function(vtx) for vtx in vertices]
 
         sorted_indices = sorted(range(9), key=lambda i: vertex_dot_values[i])
         vertices = [vertices[i] for i in sorted_indices]
@@ -278,9 +311,8 @@ def local_search(v, p, k):
 
         centroid = sum(vertices[:-1]) / 8.0
 
-        reflected = centroid + alpha * (centroid - vertices[-1])
-        reflected_dots, _ = compute_max_dot(v, reflected)
-        reflected_value = reflected_dots[k].abs() ** 2
+        reflected = clamp(centroid + alpha * (centroid - vertices[-1]))
+        reflected_value = objective_function(reflected)
 
         # if reflected point is better than second worst but not better than best
         if vertex_dot_values[0] <= reflected_value < vertex_dot_values[-2]:
@@ -289,9 +321,8 @@ def local_search(v, p, k):
 
         # expand
         if reflected_value < vertex_dot_values[0]:
-            expanded = centroid + gamma * (centroid - vertices[-1])
-            expanded_dots, _ = compute_max_dot(v, expanded)
-            expanded_value = expanded_dots[k].abs() ** 2
+            expanded = clamp(centroid + gamma * (centroid - vertices[-1]))
+            expanded_value = objective_function(expanded)
 
             if expanded_value < reflected_value:
                 vertices[-1] = expanded
@@ -303,36 +334,33 @@ def local_search(v, p, k):
         if reflected_value >= vertex_dot_values[-2]:
             if reflected_value < vertex_dot_values[-1]:
                 # outside contraction
-                contracted = centroid + rho * (reflected - centroid)
-                contracted_dots, _ = compute_max_dot(v, contracted)
-                contracted_value = contracted_dots[k].abs() ** 2
+                contracted = clamp(centroid + rho * (reflected - centroid))
+                contracted_value = objective_function(contracted)
 
                 if contracted_value < reflected_value:
                     vertices[-1] = contracted
                     continue
             else:
                 # inside contraction
-                contracted = centroid + rho * (vertices[-1] - centroid)
-                contracted_dots, _ = compute_max_dot(v, contracted)
-                contracted_value = contracted_dots[k].abs() ** 2
+                contracted = clamp(centroid + rho * (vertices[-1] - centroid))
+                contracted_value = objective_function(contracted)
 
                 if contracted_value < vertex_dot_values[-1]:
                     vertices[-1] = contracted
                     continue
 
-        # shrint
+        # shrink
         best_vertex = vertices[0]
         for i in range(1, 9):
-            vertices[i] = best_vertex + sigma * (vertices[i] - best_vertex)
+            vertices[i] = clamp(best_vertex + sigma * (vertices[i] - best_vertex))
 
     # compute the dots of the best seen p's
     best = [
-        (compute_max_dot(v, p_candidate)[0][k].abs() ** 2, p_candidate)
-        for p_candidate in best_p_seen
+        (objective_function(p_candidate), p_candidate) for p_candidate in best_p_seen
     ]
 
     # choose the smallest dot
-    # this may just be the original best p 
+    # this may just be the original best p
     best_sorted = sorted(best, key=lambda pair: pair[0])
 
     found_better = best_sorted[0][0] < best_dots[k].abs() ** 2
@@ -348,14 +376,27 @@ def test_local_search():
         f"Initial max dot at k={k_eval} with value {dots[k_eval].abs()} and p={p} and v={v}"
     )
 
-    found_better, candidates = local_search(v, p, k_eval)
+    found_better, candidates = local_search(v, p, k_eval, 10)
 
     new_dot = candidates[0][0]
     improved_p = candidates[0][1]
 
     new_dots, new_k_eval = compute_max_dot(v, improved_p)
     print(
-        f"After local search max dot at k {new_k_eval} with value {new_dots[new_k_eval].abs()} and p={improved_p} and v={v}, and found better is {found_better}"
+        f"After local search max dot at k={new_k_eval} with value {new_dots[new_k_eval].abs()} and p={improved_p} and v={v}, and found better is {found_better}"
     )
 
     assert new_dots[new_k_eval].abs() <= dots[k_eval].abs()
+
+    # plot the new points on the same plot
+    import matplotlib.pyplot as plt
+
+    plt.scatter(p[:, 0].numpy(), p[:, 1].numpy(), color="blue", label="Original Points")
+    plt.scatter(
+        improved_p[:, 0].numpy(),
+        improved_p[:, 1].numpy(),
+        color="red",
+        label="Improved Points",
+    )
+    plt.title("Local Search Improvement of Points")
+    plt.show()

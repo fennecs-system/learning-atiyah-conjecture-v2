@@ -1,11 +1,12 @@
-import math 
+import math
 import einops
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-# Fork of Karpathy's makemore.py transformer model 
+# Fork of Karpathy's makemore.py transformer model
 # We switched to einops for some clarity
+
 
 class NewGELU(nn.Module):
     """
