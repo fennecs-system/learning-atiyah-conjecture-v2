@@ -259,7 +259,7 @@ def generate_n_improved_samples(num=1000, generation=1):
     with open(out_path, "w") as f:
         while num_found < num:
             # seed 100 random samples
-            X_init = torch.zeros(1000, 1, dtype=torch.long).to(args.device)
+            X_init = torch.zeros(100, 1, dtype=torch.long).to(args.device)
             top_k = args.top_k if args.top_k != -1 else None
             steps = (
                 train_dataset.get_output_length() - 1
@@ -270,7 +270,7 @@ def generate_n_improved_samples(num=1000, generation=1):
 
             # Process samples in parallel with 10 workers
             batch_found = 0
-            max_workers = 20
+            max_workers = 100
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks for this batch

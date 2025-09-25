@@ -124,13 +124,15 @@ def create_fused_datasets(seed_dataset_file, additional_dataset_files):
 
     random.shuffle(total_words)
 
+    print(f"number of examples in the fused dataset: {len(total_words)}")
+
     test_set_size = min(
         1000, int(len(total_words) * 0.1)
     )  # 10% of the training set, or up to 1000 examples
 
     rp = torch.randperm(len(total_words)).tolist()
-    train_words = [words[i] for i in rp[:-test_set_size]]
-    test_words = [words[i] for i in rp[-test_set_size:]]
+    train_words = [total_words[i] for i in rp[:-test_set_size]]
+    test_words = [total_words[i] for i in rp[-test_set_size:]]
     print(
         f"split up the dataset into {len(train_words)} training examples and {len(test_words)} test examples"
     )
