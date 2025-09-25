@@ -20,9 +20,15 @@ import time
 import argparse
 from dataclasses import dataclass
 from itertools import takewhile
+import gc
 
 from utils import decode_and_check, local_search, compute_max_dot, encode
 import time
+
+from typing import Optional, Tuple
+
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torch.nn as nn
@@ -39,7 +45,9 @@ from dataset_utils import create_datasets, create_fused_datasets, InfiniteDataLo
 @dataclass
 class ModelConfig:
     block_size: int | None = None  # length of the input sequences of integers
-    vocab_size: int | None = None  # the input integers are in range [0 .. vocab_size -1]
+    vocab_size: int | None = (
+        None  # the input integers are in range [0 .. vocab_size -1]
+    )
     # parameters below control the sizes of each model slightly differently
     n_layer: int = 4
     n_embd: int = 512  # refers to the total for the multi-head attention so must be divisible by n_head
@@ -194,12 +202,60 @@ def check_sample_valid(word):
 
 
 def generate_n_improved_samples(num=1000, generation=1):
+    write_lock = threading.Lock()
+
+    def process_sample(i: int, X_samp, f) -> Optional[Tuple[int, str]]:
+        """Process a single sample and return result if valid improvement found."""
+        try:
+            # get the i'th row of sampled integers, as python list
+            row = X_samp[
+                i, 1:
+            ].tolist()  # note: we need to crop out the first <START> token
+            # token 0 is the <STOP> token, so we crop the output sequence at that point
+            crop_index = row.index(0) if 0 in row else len(row)
+            row = row[:crop_index]
+            word_samp = train_dataset.decode(row)
+
+            # separately track samples that we have and have not seen before
+            if train_dataset.contains(word_samp):
+                return None
+            elif test_dataset.contains(word_samp):
+                return None
+            else:
+                # its not in the dataset
+                try:
+                    v, p, k = check_sample_valid(word_samp)
+                    found_better, candidates = local_search(v, p, k, 10)
+                    improved_p = candidates[0][1]
+                    _, new_k_eval = compute_max_dot(v, improved_p)
+
+                    if found_better:
+                        tokens = encode(v, improved_p, new_k_eval)
+                        tokens_str = ",".join([str(x) for x in tokens]) + "\n"
+
+                        # Thread-safe file writing
+                        with write_lock:
+                            print(f"Found improved sample {tokens}")
+                            f.write(tokens_str)
+                            f.flush()  # Ensure immediate write
+
+                        return (i, tokens_str)
+
+                except Exception as e:
+                    return None
+
+        except Exception as e:
+            return None
+
+        return None
+
     # generate 100 samples at a time
     # keep the ones that are valid and can be improved by local search
     # and are not already in the train or test set
     # repeat until we have num such samples
     num_found = 0
     out_path = os.path.join(run_dir, f"data_generation-{generation}.txt")
+
     with open(out_path, "w") as f:
         while num_found < num:
             # seed 100 random samples
@@ -211,40 +267,47 @@ def generate_n_improved_samples(num=1000, generation=1):
             X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to(
                 "cpu"
             )
-            for i in range(X_samp.size(0)):
-                # get the i'th row of sampled integers, as python list
-                row = X_samp[
-                    i, 1:
-                ].tolist()  # note: we need to crop out the first <START> token
-                # token 0 is the <STOP> token, so we crop the output sequence at that point
-                crop_index = row.index(0) if 0 in row else len(row)
-                row = row[:crop_index]
-                word_samp = train_dataset.decode(row)
-                # separately track samples that we have and have not seen before
-                if train_dataset.contains(word_samp):
-                    # next
-                    continue
-                elif test_dataset.contains(word_samp):
-                    continue
-                else:
-                    # its not in the dataset
-                    try:
-                        v, p, k = check_sample_valid(word_samp)
-                        found_better, candidates = local_search(v, p, k, 10)
-                        improved_p = candidates[0][1]
-                        _, new_k_eval = compute_max_dot(v, improved_p)
 
-                        if found_better:
-                            # append to valid improved samples
-                            num_found += 1
-                            tokens = encode(v, improved_p, new_k_eval)
-                            print(f"Found improved sample {tokens}")
-                            f.write(",".join([str(x) for x in tokens]) + "\n")
+            # Process samples in parallel with 10 workers
+            batch_found = 0
+            max_workers = 20
 
-                        # try to improve it by local search
-                    except Exception as e:
-                        continue
-        # write all examples to data_generation.txt
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks for this batch
+                futures = {
+                    executor.submit(process_sample, i, X_samp, f): i
+                    for i in range(X_samp.size(0))
+                }
+
+                # Process completed tasks
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        batch_found += 1
+                        num_found += 1
+
+                        # Stop early if we've found enough samples
+                        if num_found >= num:
+                            # Cancel remaining futures to avoid unnecessary work
+                            for remaining_future in futures:
+                                if not remaining_future.done():
+                                    remaining_future.cancel()
+                            break
+
+            print(
+                f"Batch complete: found {batch_found} new samples. Total: {num_found}/{num}"
+            )
+
+            # clear the torch cache
+            gc.collect()
+
+            # Break if we've found enough samples
+            if num_found >= num:
+                break
+
+    print(
+        f"Generation {generation} complete: {num_found} improved samples saved to {out_path}"
+    )
 
 
 def train_one_generation(
