@@ -144,7 +144,7 @@ def print_samples(num=10):
     print("-" * 80)
     return num_new_correct, len(new_samples)
 
-
+# a sample must be grammatically correct
 def check_sample_valid(word):
     # 4 points, in R^2 
     n = 4
@@ -168,6 +168,12 @@ def check_sample_valid(word):
         p_ints = list(takewhile(lambda x : x < 103, it))
 
         assert all(x < 103 for x in p_ints)
+        # assert not all zeros for p
+        assert not all(x == 0 for x in p_ints)
+
+        # assert that at least 80% are non zero 
+        assert sum(1 for x in p_ints if x != 0) >= 0.8 * len(p_ints)
+
         # assert at most 16 tokens for p (one token for sign, one for value)
         assert len(p_ints) <= 2 * n * dim
 
@@ -188,53 +194,55 @@ def check_sample_valid(word):
 
 
 def generate_n_improved_samples(num=1000, generation=1):
-    # generate 10 samples at a time
+    # generate 100 samples at a time
     # keep the ones that are valid and can be improved by local search
     # and are not already in the train or test set
     # repeat until we have num such samples
-    valid_improved_samples = []
-    while len(valid_improved_samples) < num:
-        X_init = torch.zeros(10, 1, dtype=torch.long).to(args.device)
-        top_k = args.top_k if args.top_k != -1 else None
-        steps = (
-            train_dataset.get_output_length() - 1
-        )  # -1 because we already start with <START> token (index 0)
-        X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to("cpu")
-        for i in range(X_samp.size(0)):
-            # get the i'th row of sampled integers, as python list
-            row = X_samp[
-                i, 1:
-            ].tolist()  # note: we need to crop out the first <START> token
-            # token 0 is the <STOP> token, so we crop the output sequence at that point
-            crop_index = row.index(0) if 0 in row else len(row)
-            row = row[:crop_index]
-            word_samp = train_dataset.decode(row)
-            # separately track samples that we have and have not seen before
-            if train_dataset.contains(word_samp):
-                # next
-                continue
-            elif test_dataset.contains(word_samp):
-                continue
-            else:
-                # its not in the dataset
-                try:
-                    v, p, k = check_sample_valid(word_samp)
-                    found_better, candidates = local_search(v, p, k, 10)
-                    improved_p = candidates[0][1]
-                    _, new_k_eval = compute_max_dot(v, improved_p)
-
-                    if found_better:
-                        # append to valid improved samples
-                        valid_improved_samples.append((v, improved_p, new_k_eval))
-                    # try to improve it by local search
-                except Exception as e:
-                    continue
-    # write all examples to data_generation.txt
+    num_found = 0
     out_path = os.path.join(run_dir, f"data_generation-{generation}.txt")
     with open(out_path, "w") as f:
-        for v, p, k in valid_improved_samples[:num]:
-            tokens = encode(v, p, k)
-            f.write(",".join([str(x) for x in tokens]) + "\n")
+        while num_found < num:
+            # seed 100 random samples
+            X_init = torch.zeros(100, 1, dtype=torch.long).to(args.device)
+            top_k = args.top_k if args.top_k != -1 else None
+            steps = (
+                train_dataset.get_output_length() - 1
+            )  # -1 because we already start with <START> token (index 0)
+            X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to("cpu")
+            for i in range(X_samp.size(0)):
+                # get the i'th row of sampled integers, as python list
+                row = X_samp[
+                    i, 1:
+                ].tolist()  # note: we need to crop out the first <START> token
+                # token 0 is the <STOP> token, so we crop the output sequence at that point
+                crop_index = row.index(0) if 0 in row else len(row)
+                row = row[:crop_index]
+                word_samp = train_dataset.decode(row)
+                # separately track samples that we have and have not seen before
+                if train_dataset.contains(word_samp):
+                    # next
+                    continue
+                elif test_dataset.contains(word_samp):
+                    continue
+                else:
+                    # its not in the dataset
+                    try:
+                        v, p, k = check_sample_valid(word_samp)
+                        found_better, candidates = local_search(v, p, k, 10)
+                        improved_p = candidates[0][1]
+                        _, new_k_eval = compute_max_dot(v, improved_p)
+
+                        if found_better:
+                            # append to valid improved samples
+                            num_found += 1
+                            tokens = encode(v, improved_p, new_k_eval)
+                            print(f"Found improved sample {tokens}")
+                            f.write(",".join([str(x) for x in tokens]) + "\n")
+
+                        # try to improve it by local search
+                    except Exception as e:
+                        continue
+        # write all examples to data_generation.txt
 
 
 def train_one_generation(model, optimizer, batch_loader, out_path, sample_step, generation, args):
