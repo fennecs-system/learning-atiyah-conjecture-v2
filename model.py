@@ -50,6 +50,20 @@ class CausalSelfAttention(nn.Module):
         )
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.attn_dropout = nn.Dropout(config.dropout)  # ADD THIS
+        self.resid_dropout = nn.Dropout(config.dropout)  # ADD THIS
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
 
     def forward(self, x):
         B, T, C = (
@@ -90,6 +104,7 @@ class CausalSelfAttention(nn.Module):
         att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
         att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
 
         # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = einops.einsum(att, v, "B nh T T, B nh T hs -> B nh T hs")
@@ -99,6 +114,8 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.c_proj(y)
+        y = self.resid_dropout(y)
+
         return y
 
 

@@ -4,9 +4,9 @@ import torch
 n = 4
 
 # open file to write
-with open("data.txt", "w") as f:
+with open("data.txt", "a") as f:
     # write lines of data to file
-    for i in range(100000):
+    for i in range(500000):
         data = gen_rand_sample_2d_data(4, 2)
         v, p, dots = data
         k = torch.argmax(dots.abs()).item()

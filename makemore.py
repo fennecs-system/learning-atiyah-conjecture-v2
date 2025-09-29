@@ -20,9 +20,8 @@ import time
 import argparse
 from dataclasses import dataclass
 from itertools import takewhile
-import gc
 
-from utils import decode_and_check, local_search, compute_max_dot, encode
+from utils import decode_and_check, local_search, compute_max_dot, encode, warmup_lambda
 import time
 
 from typing import Optional, Tuple
@@ -36,17 +35,9 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from model import Transformer
-from dataset_utils import create_datasets, create_fused_datasets, StreamDataLoader
+from dataset_utils import create_datasets, create_fused_int_datasets, StreamDataLoader
 
 # -----------------------------------------------------------------------------
-
-
-def warmup_lambda(step):
-    warmup_steps = 500
-    if step < warmup_steps:
-        return step / warmup_steps
-
-    return 1.0
 
 
 @dataclass
@@ -56,9 +47,10 @@ class ModelConfig:
         None  # the input integers are in range [0 .. vocab_size -1]
     )
     # parameters below control the sizes of each model slightly differently
-    n_layer: int = 4
-    n_embd: int = 512  # refers to the total for the multi-head attention so must be divisible by n_head
+    n_layer: int = 6
+    n_embd: int = 128  # refers to the total for the multi-head attention so must be divisible by n_head
     n_head: int = 4
+    dropout: float = 0.0  # for future use
 
 
 def atomic_torch_save(dict, filename):
@@ -105,22 +97,24 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
 
 def print_samples(num=10):
     """samples from the model and pretty prints the decoded samples"""
+
     X_init = torch.zeros(num, 1, dtype=torch.long).to(args.device)
     top_k = args.top_k if args.top_k != -1 else None
-    steps = (
-        train_dataset.get_output_length() - 1
-    )  # -1 because we already start with <START> token (index 0)
+    steps = train_dataset.get_output_length() - 1
     X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to("cpu")
+
     train_samples, test_samples, new_samples = [], [], []
     for i in range(X_samp.size(0)):
-        # get the i'th row of sampled integers, as python list
-        row = X_samp[
-            i, 1:
-        ].tolist()  # note: we need to crop out the first <START> token
-        # token 0 is the <STOP> token, so we crop the output sequence at that point
-        crop_index = row.index(0) if 0 in row else len(row)
+        row = X_samp[i, 1:].tolist()
+
+        # Find special token (not 0)
+        stop_token = train_dataset.stop_token  # your special token
+        crop_index = row.index(stop_token) if stop_token in row else len(row)
         row = row[:crop_index]
-        word_samp = train_dataset.decode(row)
+
+        # Decode returns list of ints, convert to comma-separated string
+        decoded_ints = train_dataset.decode(row)
+        word_samp = ",".join(map(str, decoded_ints))  # Convert to string format
         # separately track samples that we have and have not seen before
         if train_dataset.contains(word_samp):
             train_samples.append(word_samp)
@@ -143,8 +137,11 @@ def print_samples(num=10):
             # check if the word is a valid list of integers
             try:
                 word = [int(x.strip()) for x in word.split(",") if x.strip()]
-                if decode_and_check(word):
-                    num_correct += 1
+
+                if check_sample_valid(word) is not None:
+                    if decode_and_check(word) is not None:
+                        print(word)
+                        num_correct += 1
             except Exception as e:
                 pass
                 # print(f"Could not convert {word} to list of integers: {e}")
@@ -212,6 +209,9 @@ def check_sample_valid(word):
 
 
 def generate_n_improved_samples(num=1000, generation=1):
+    max_attempts = 100000 / num
+    attempt = 0
+
     def process_sample(i: int, X_samp) -> Optional[Tuple[int, str]]:
         """Process a single sample and return result if valid improvement found."""
         try:
@@ -281,6 +281,12 @@ def generate_n_improved_samples(num=1000, generation=1):
             # Process samples in parallel with 10 workers
             batch_found = 0
             max_workers = 100
+            attempt += 1
+            if attempt > max_attempts:
+                print(
+                    f"Reached maximum attempts ({max_attempts}) without finding enough samples."
+                )
+                break
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks for this batch
@@ -352,6 +358,10 @@ def train_one_batch(
     batch = [t.to(args.device) for t in batch]
     X, Y = batch
 
+    # print(f"X.shape {X.shape} Y.shape {Y.shape}")
+    # print(f"X[0,:] {X[0,:]}")
+    # print(f"Y[0,:] {Y[0,:]}")  # print the first row of X and Y
+
     # feed into the model
     logits, loss = model(X, Y)
 
@@ -369,7 +379,7 @@ def train_one_batch(
     # logging
     if step % 10 == 0:
         print(
-            f"step {step} | loss {loss.item():.4f} | step time {(t1 - t0) * 1000:.2f}ms"
+            f"step {step} | loss {loss.item():.4f} | step time {(t1 - t0) * 1000:.2f}ms | step lr {scheduler.get_last_lr()[0]:.2e}"
         )
 
     # evaluate the model
@@ -427,6 +437,8 @@ def train_one_batch(
             step + generation * total_batches,
         )
 
+    return best_loss
+
 
 def train_one_epoch(
     model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args
@@ -438,7 +450,7 @@ def train_one_epoch(
 
     while True:
         try:
-            train_one_batch(
+            best_loss = train_one_batch(
                 model,
                 optimizer,
                 scheduler,
@@ -453,7 +465,9 @@ def train_one_epoch(
             )
             step += 1
         except Exception as e:
+            print("Exception during training:")
             print(e)
+            print("Continuing to next batch...")
 
         if step >= total_batches:
             print("End of epoch")
@@ -538,7 +552,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
+        default="mps",
         help="device to use for compute, examples: cpu|cuda|cuda:2|mps",
     )
     parser.add_argument("--seed", type=int, default=3407, help="seed")
@@ -558,18 +572,15 @@ if __name__ == "__main__":
     parser.add_argument("--block-size", type=int, help="block size of training data")
 
     # model
-    parser.add_argument("--n-layer", type=int, default=4, help="number of layers")
+    parser.add_argument("--n-layer", type=int, default=8, help="number of layers")
     parser.add_argument(
         "--n-head", type=int, default=4, help="number of heads (in a transformer)"
     )
     parser.add_argument(
-        "--n-embd", type=int, default=64, help="number of feature channels in the model"
-    )
-    parser.add_argument(
-        "--n-embd2",
+        "--n-embd",
         type=int,
-        default=64,
-        help="number of feature channels elsewhere in the model",
+        default=144,
+        help="number of feature channels in the model",
     )
 
     # optimization
@@ -577,14 +588,14 @@ if __name__ == "__main__":
         "--batch-size",
         "-b",
         type=int,
-        default=64,
+        default=256,
         help="batch size during optimization",
     )
     parser.add_argument(
-        "--learning-rate", "-l", type=float, default=5e-4, help="learning rate"
+        "--learning-rate", "-l", type=float, default=1e-4, help="learning rate"
     )
     parser.add_argument(
-        "--weight-decay", "-w", type=float, default=0.01, help="weight decay"
+        "--weight-decay", "-w", type=float, default=0.001, help="weight decay"
     )
     args = parser.parse_args()
     print(vars(args))
@@ -648,13 +659,15 @@ if __name__ == "__main__":
                 f"loading fused dataset from {len(all_other_data_files)} files, up to generation {starting_generation}"
             )
             # load the fused dataset
-            train_dataset, test_dataset = create_fused_datasets(
+            train_dataset, test_dataset = create_fused_int_datasets(
                 generation_zero, all_other_data_files
             )
 
         vocab_size = train_dataset.get_vocab_size()
         block_size = train_dataset.get_output_length()
         print(f"dataset determined that: {vocab_size=}, {block_size=}")
+
+    assert args.n_embd > 64
 
     # init model
     config = ModelConfig(
@@ -663,6 +676,7 @@ if __name__ == "__main__":
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
+        dropout=0.0,
     )
 
     model = Transformer(config)
@@ -709,6 +723,7 @@ if __name__ == "__main__":
         sys.exit()
 
     # training loop
+    do_generation = False
 
     for generation in range(starting_generation, max_pattern_boost_steps):
         train_one_epoch(
@@ -725,32 +740,31 @@ if __name__ == "__main__":
         print(f"finished generation {generation}, generating new samples")
 
         # set model to
-        model.eval()
         # save in generation+1, since we take initial dataset as generation 0
-        generate_n_improved_samples(num=1000, generation=generation + 1)
+        if do_generation:
+            model.eval()
+            generate_n_improved_samples(num=1000, generation=generation + 1)
 
-        # rebuild the dataloaders with the new data
-        all_other_data_files = []
+            # rebuild the dataloaders with the new data
+            all_other_data_files = []
 
-        for gen in range(1, generation + 2):
-            gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
-            if os.path.exists(gen_file):
-                all_other_data_files.append(gen_file)
+            for gen in range(1, generation + 2):
+                gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
+                if os.path.exists(gen_file):
+                    all_other_data_files.append(gen_file)
 
-        print(
-            f"loading fused dataset from {len(all_other_data_files)} files, up to generation {generation + 1}"
-        )
-        generation_zero = args.input_file
+            print(
+                f"loading fused dataset from {len(all_other_data_files)} files, up to generation {generation + 1}"
+            )
+            generation_zero = args.input_file
 
-        train_dataset, test_dataset = create_fused_datasets(
-            generation_zero, all_other_data_files
-        )
-        batch_loader = StreamDataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            pin_memory=True,
-            num_workers=args.num_workers,
-        )
-
-        # set model back to train mode
-        model.train()
+            train_dataset, test_dataset = create_fused_int_datasets(
+                generation_zero, all_other_data_files
+            )
+            batch_loader = StreamDataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                pin_memory=True,
+                num_workers=args.num_workers,
+            )
+            model.train()

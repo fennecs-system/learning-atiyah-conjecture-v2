@@ -8,10 +8,62 @@ from torch import argmax, dot, empty, rand, stack
 from torch import Tensor
 
 
+def warmup_lambda(step):
+    warmup_steps = 2000
+
+    # linearly warm up the learning rate from a small value to the target lr
+
+    if step < warmup_steps:
+        return step / warmup_steps
+
+    # for 2000 steps after the warmup, increase the learning rate to 
+    # 10x the learing rate for 2000 steps 
+
+    peak_step = 4000 
+
+    if step < peak_step:
+        return 1.0 + (step - warmup_steps) / (peak_step - warmup_steps) * 9.0
+    
+    # after that decay back down to the original lr 
+
+    decay_step = 8000
+
+    if step < decay_step:
+        return 10.0 - (step - peak_step) / (decay_step - peak_step) * 9.0 
+
+    return 1.0
+
 # rounds a tensor to n decimal places
 def round_by(x, n):
     x = (x * 10**n).round() / (10**n)
     return x
+
+
+def gen_poly(v, p, k):
+    ps = p.unsqueeze(1) - p.unsqueeze(0)
+    M = ps.square().sum(2).sqrt()
+    xs = ps[:, :, 0]
+    Xi = stack(((M + xs).sqrt(), (M - xs).sqrt()))
+
+    for j in range(4):
+        poly_j = []
+        for k in range(4):
+            if j == k:
+                continue
+            else:
+                y_jk = ps[j, k][1]
+                if y_jk < 0:
+                    poly_j.append(PolyM([-Xi[1][j, k], Xi[0][j, k]]))
+                elif y_jk > 0:
+                    poly_j.append(PolyM([Xi[0][j, k], Xi[1][j, k]]))
+                else:  # y_jk =0
+                    x_jk = ps[j, k][0]
+                    if x_jk < 0:
+                        poly_j.append(PolyM([Xi[0][j, k], Xi[1][j, k]]))
+                    else:
+                        poly_j.append(PolyM([Xi[0][j, k], Xi[1][j, k]]))
+
+    return poly_j
 
 
 def gen_rand_sample_2d_data(n_points: int, round_factor: int = 2):
@@ -78,7 +130,6 @@ def gen_rand_sample_2d_data(n_points: int, round_factor: int = 2):
 # 103 to denote end of p / v / k
 # 104 -> 127 (0 indexed)
 
-
 SIGN_TOKEN = 102
 END_BLOCK_TOKEN = 103
 CLASS_START = 104
@@ -92,7 +143,7 @@ def encode(v, p, k):
         if vk < 0:
             vk *= -1
             encoded.append(SIGN_TOKEN)
-        encoded.append(int(vk * 100) + 1)
+        encoded.append(int(vk * 100))
     encoded.append(END_BLOCK_TOKEN)
 
     for j in range(n):
@@ -100,11 +151,11 @@ def encode(v, p, k):
         if x < 0:
             x *= -1
             encoded.append(SIGN_TOKEN)
-        encoded.append(int(x * 100) + 1)
+        encoded.append(int(x * 100) )
         if y < 0:
             y *= -1
             encoded.append(SIGN_TOKEN)
-        encoded.append(int(y * 100) + 1)
+        encoded.append(int(y * 100))
     encoded.append(END_BLOCK_TOKEN)
 
     encoded.append(k + CLASS_START)
@@ -165,9 +216,120 @@ def decode(encoded):
 
     p_tensor = torch.tensor(p, dtype=torch.float32)
     v_tensor = torch.tensor(v, dtype=torch.float32)
-    # k_tensor = torch.tensor([k], dtype=torch.int64)  # k is a single value, so wrap in a list
 
     return v_tensor, p_tensor, k
+
+
+def encode_w_dots(v, p, dots):
+    # similar to encode but encode the dots - storing to two dp, with the sign, also append 103 and then k at the end
+    encoded = []
+    n, _ = p.shape
+
+    for j in range(n):
+        vk = v[j]
+        if vk < 0:
+            vk *= -1
+            encoded.append(SIGN_TOKEN)
+        encoded.append(int(vk * 100))
+    encoded.append(END_BLOCK_TOKEN)
+
+    for j in range(n):
+        x, y = p[j]
+        if x < 0:
+            x *= -1
+            encoded.append(SIGN_TOKEN)
+        encoded.append(int(x * 100))
+        if y < 0:
+            y *= -1
+            encoded.append(SIGN_TOKEN)
+        encoded.append(int(y * 100))
+    encoded.append(END_BLOCK_TOKEN)
+
+    for j in range(n):
+        dot = dots[j]
+        if dot < 0:
+            dot *= -1
+            encoded.append(SIGN_TOKEN)
+        encoded.append(int(dot * 100))
+    encoded.append(END_BLOCK_TOKEN)
+
+    k = torch.argmax(dots.abs()).item()
+
+    encoded.append(k + CLASS_START)
+    return encoded
+
+
+def decode_w_dots(encoded):
+    v = []
+    p = []
+    dots = []
+    k = None
+    is_negative = False  # Flag to track if the current number is negative
+
+    # Split the encoded list at END_BLOCK_TOKENs
+    blocks = []
+    temp_block = []
+    for num in encoded:
+        if num == END_BLOCK_TOKEN:
+            blocks.append(temp_block)
+            temp_block = []
+        else:
+            temp_block.append(num)
+
+    # decode v block
+    v_block = blocks[0]
+    for num in v_block:
+        if num == SIGN_TOKEN:
+            is_negative = True
+            continue
+
+        val = (num - 1) / 100.0
+        if is_negative:
+            val *= -1
+            is_negative = False
+        v.append(val)
+
+    # Decode `p` block
+    p_block = blocks[1]
+    i = 0
+    while i < len(p_block):
+        if p_block[i] == SIGN_TOKEN:
+            is_negative = True
+            i += 1
+            continue
+
+        val = (p_block[i] - 1) / 100.0
+        if is_negative:
+            val *= -1
+            is_negative = False
+        if i % 2 == 0:
+            temp_tuple = (val,)
+        else:
+            p.append(temp_tuple + (val,))
+        i += 1
+
+    # decode dots block
+    # similar to v block
+    dots_block = blocks[2]
+    for num in dots_block:
+        if num == SIGN_TOKEN:
+            is_negative = True
+            continue
+
+        val = (num - 1) / 100.0
+        if is_negative:
+            val *= -1
+            is_negative = False
+        dots.append(val)
+    # Decode `k`
+    #
+    k = blocks[3][0] - CLASS_START
+
+    p_tensor = torch.tensor(p, dtype=torch.float32)
+    v_tensor = torch.tensor(v, dtype=torch.float32)
+    dots_tensor = torch.tensor(dots, dtype=torch.float32)
+
+    return v_tensor, p_tensor, dots_tensor, k
 
 
 def compute_max_dot(v: Tensor, p: Tensor):
