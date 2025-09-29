@@ -14,220 +14,49 @@ Changes from minGPT:
   difference at the scale that we operate on here.
 """
 
-import einops
-
 import os
 import sys
 import time
-import math
 import argparse
 from dataclasses import dataclass
-from typing import List
+from itertools import takewhile
 
-from utils import decode_and_check
+from utils import decode_and_check, local_search, compute_max_dot, encode, warmup_lambda
 import time
+
+from typing import Optional, Tuple
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+
+from model import Transformer
+from dataset_utils import create_datasets, create_fused_int_datasets, StreamDataLoader
 
 # -----------------------------------------------------------------------------
 
 
 @dataclass
 class ModelConfig:
-    block_size: int = None  # length of the input sequences of integers
-    vocab_size: int = None  # the input integers are in range [0 .. vocab_size -1]
+    block_size: int | None = None  # length of the input sequences of integers
+    vocab_size: int | None = (
+        None  # the input integers are in range [0 .. vocab_size -1]
+    )
     # parameters below control the sizes of each model slightly differently
-    n_layer: int = 4
-    n_embd: int = 64  # refers to the total for the multi-head attention so must be divisible by n_head
+    n_layer: int = 6
+    n_embd: int = 128  # refers to the total for the multi-head attention so must be divisible by n_head
     n_head: int = 4
+    dropout: float = 0.0  # for future use
 
 
 def atomic_torch_save(dict, filename):
     tempname = filename + ".tmp"
     torch.save(dict, tempname)
     os.replace(tempname, filename)
-
-
-# -----------------------------------------------------------------------------
-# Transformer Language Model (*exactly* as used in GPT-2)
-
-
-class NewGELU(nn.Module):
-    """
-    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
-    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
-    """
-
-    def forward(self, x):
-        return (
-            0.5
-            * x
-            * (
-                1.0
-                + torch.tanh(
-                    math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))
-                )
-            )
-        )
-
-
-class CausalSelfAttention(nn.Module):
-    """
-    A vanilla multi-head masked self-attention layer with a projection at the end.
-    It is possible to use torch.nn.MultiheadAttention here but I am including an
-    explicit implementation here to show that there is nothing too scary here.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-    def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # use einops to move around the head dimension
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # split the last dimension into 3 (q, k, v), then into (nh, hs)
-        q, k, v = einops.rearrange(
-            self.c_attn(x),
-            "B T (three embed) -> three B T embed",
-            three=3,
-            embed=self.n_embd,
-        )
-
-        k = einops.rearrange(
-            k, "B T (nh hs) -> B nh T hs", nh=self.n_head, hs=C // self.n_head
-        )
-        q = einops.rearrange(
-            q, "B T (nh hs) -> B nh T hs", nh=self.n_head, hs=C // self.n_head
-        )
-        v = einops.rearrange(
-            v, "B T (nh hs) -> B nh T hs", nh=self.n_head, hs=C // self.n_head
-        )
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-
-        # swap the last two dimensions of k
-        k = einops.rearrange(k, "B nh T hs -> B nh hs T")
-
-        # T = S
-        att = einops.einsum(q, k, "B nh T hs, B nh hs S -> B nh T S") * (
-            1.0 / math.sqrt(k.size(-2))
-        )
-
-        # gpt style
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-
-        att = F.softmax(att, dim=-1)
-
-        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = einops.einsum(att, v, "B nh T T, B nh T hs -> B nh T hs")
-
-        # transpose
-        y = einops.rearrange(y, "B nh T hs -> B T (nh hs)")
-
-        # output projection
-        y = self.c_proj(y)
-        return y
-
-
-class Block(nn.Module):
-    """an unassuming Transformer block"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = nn.ModuleDict(
-            dict(
-                c_fc=nn.Linear(config.n_embd, 4 * config.n_embd),
-                c_proj=nn.Linear(4 * config.n_embd, config.n_embd),
-                act=NewGELU(),
-            )
-        )
-        m = self.mlp
-        self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x)))  # MLP forward
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
-        return x
-
-
-class Transformer(nn.Module):
-    """Transformer Language Model, exactly as seen in GPT-2"""
-
-    def __init__(self, config):
-        super().__init__()
-        self.block_size = config.block_size
-
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                wpe=nn.Embedding(config.block_size, config.n_embd),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f=nn.LayerNorm(config.n_embd),
-            )
-        )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # report number of parameters (note we don't count the decoder parameters in lm_head)
-        n_params = sum(p.numel() for p in self.transformer.parameters())
-        print("number of parameters: %.2fM" % (n_params / 1e6,))
-
-    def get_block_size(self):
-        return self.block_size
-
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.block_size, (
-            f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        )
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(
-            0
-        )  # shape (1, t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(
-            pos
-        )  # position embeddings of shape (1, t, n_embd)
-        x = tok_emb + pos_emb
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-
-        # if we are given some desired targets also calculate the loss
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
-
-        return logits, loss
 
 
 # -----------------------------------------------------------------------------
@@ -268,22 +97,24 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
 
 def print_samples(num=10):
     """samples from the model and pretty prints the decoded samples"""
+
     X_init = torch.zeros(num, 1, dtype=torch.long).to(args.device)
     top_k = args.top_k if args.top_k != -1 else None
-    steps = (
-        train_dataset.get_output_length() - 1
-    )  # -1 because we already start with <START> token (index 0)
+    steps = train_dataset.get_output_length() - 1
     X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to("cpu")
+
     train_samples, test_samples, new_samples = [], [], []
     for i in range(X_samp.size(0)):
-        # get the i'th row of sampled integers, as python list
-        row = X_samp[
-            i, 1:
-        ].tolist()  # note: we need to crop out the first <START> token
-        # token 0 is the <STOP> token, so we crop the output sequence at that point
-        crop_index = row.index(0) if 0 in row else len(row)
+        row = X_samp[i, 1:].tolist()
+
+        # Find special token (not 0)
+        stop_token = train_dataset.stop_token  # your special token
+        crop_index = row.index(stop_token) if stop_token in row else len(row)
         row = row[:crop_index]
-        word_samp = train_dataset.decode(row)
+
+        # Decode returns list of ints, convert to comma-separated string
+        decoded_ints = train_dataset.decode(row)
+        word_samp = ",".join(map(str, decoded_ints))  # Convert to string format
         # separately track samples that we have and have not seen before
         if train_dataset.contains(word_samp):
             train_samples.append(word_samp)
@@ -304,12 +135,13 @@ def print_samples(num=10):
         for word in lst:
             # strip out the commas
             # check if the word is a valid list of integers
-
             try:
                 word = [int(x.strip()) for x in word.split(",") if x.strip()]
-                if decode_and_check(word):
-                    num_correct += 1
 
+                if check_sample_valid(word) is not None:
+                    if decode_and_check(word) is not None:
+                        print(word)
+                        num_correct += 1
             except Exception as e:
                 pass
                 # print(f"Could not convert {word} to list of integers: {e}")
@@ -322,6 +154,326 @@ def print_samples(num=10):
             num_new_correct = num_correct
     print("-" * 80)
     return num_new_correct, len(new_samples)
+
+
+# a sample must be grammatically correct
+def check_sample_valid(word):
+    # 4 points, in R^2
+    n = 4
+    dim = 2
+
+    try:
+        ints = [int(x.strip()) for x in word.split(",") if x.strip()]
+
+        # assert the first four tokens before the stop token 103 - eg the v
+        # is less than 102  -- allowing for sign
+        it = iter(ints)
+        v_ints = list(takewhile(lambda x: x < 103, it))
+        assert all(x < 103 for x in v_ints)
+
+        # assert at most 8 tokens for v (one token for sign, one for value)
+        assert len(v_ints) <= 2 * n
+
+        # check that the next block of tokens before the stop token 103
+        # take everything after the head
+        it = list(it)[1:]
+        p_ints = list(takewhile(lambda x: x < 103, it))
+
+        assert all(x < 103 for x in p_ints)
+        # assert not all zeros for p
+        assert not all(x == 0 for x in p_ints)
+
+        # assert that at least 50% are non zero
+        assert sum(1 for x in p_ints if x != 0) >= 0.5 * len(p_ints)
+
+        # assert that the p ints cant be all the same, possibly removing 102
+        assert len(set(p_ints) - {102}) > 1
+
+        # assert at most 16 tokens for p (one token for sign, one for value)
+        assert len(p_ints) <= 2 * n * dim
+
+        v, p, k = decode_and_check(ints)
+
+        # k should be a valid index
+        assert k >= 0 and k < len(v)
+
+        # assert k should be 1 x 4
+        assert v.shape == (n,)
+        # p should be 4 x 2
+        # two points in 2D for each of the 4 vertices
+        assert p.shape == (n, dim)
+
+        return v, p, k
+    except Exception as e:
+        return None
+
+
+def generate_n_improved_samples(num=1000, generation=1):
+    max_attempts = 100000 / num
+    attempt = 0
+
+    def process_sample(i: int, X_samp) -> Optional[Tuple[int, str]]:
+        """Process a single sample and return result if valid improvement found."""
+        try:
+            # get the i'th row of sampled integers, as python list
+            row = X_samp[
+                i, 1:
+            ].tolist()  # note: we need to crop out the first <START> token
+            # token 0 is the <STOP> token, so we crop the output sequence at that point
+            crop_index = row.index(0) if 0 in row else len(row)
+            row = row[:crop_index]
+            word_samp = train_dataset.decode(row)
+
+            # separately track samples that we have and have not seen before
+            if train_dataset.contains(word_samp):
+                return None
+            elif test_dataset.contains(word_samp):
+                return None
+            else:
+                # its not in the dataset
+                try:
+                    v, p, k = check_sample_valid(word_samp)
+                    found_better, candidates = local_search(v, p, k, 10)
+                    improved_p = candidates[0][1]
+                    _, new_k_eval = compute_max_dot(v, improved_p)
+
+                    if found_better:
+                        tokens = encode(v, improved_p, new_k_eval)
+                        tokens_str = ",".join([str(x) for x in tokens]) + "\n"
+
+                        # Thread-safe file writing
+                        print(f"Found improved sample {tokens}")
+
+                        return (i, tokens_str)
+
+                except Exception as e:
+                    return None
+
+        except Exception as e:
+            return None
+
+        return None
+
+    # generate 100 samples at a time
+    # keep the ones that are valid and can be improved by local search
+    # and are not already in the train or test set
+    # repeat until we have num such samples
+    num_found = 0
+    out_path = os.path.join(run_dir, f"data_generation-{generation}.txt")
+
+    write_batch_num = 10
+    current_write_batch = 0
+
+    with open(out_path, "w") as f:
+        while num_found < num:
+            write_batch_str = ""
+
+            # seed 100 random samples
+            X_init = torch.zeros(100, 1, dtype=torch.long).to(args.device)
+            top_k = args.top_k if args.top_k != -1 else None
+            steps = (
+                train_dataset.get_output_length() - 1
+            )  # -1 because we already start with <START> token (index 0)
+            X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to(
+                "cpu"
+            )
+
+            # Process samples in parallel with 10 workers
+            batch_found = 0
+            max_workers = 100
+            attempt += 1
+            if attempt > max_attempts:
+                print(
+                    f"Reached maximum attempts ({max_attempts}) without finding enough samples."
+                )
+                break
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks for this batch
+                futures = {
+                    executor.submit(process_sample, i, X_samp): i
+                    for i in range(X_samp.size(0))
+                }
+
+                # Process completed tasks
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        i, tokens_str = result
+
+                        write_batch_str += tokens_str
+                        current_write_batch += 1
+
+                        if current_write_batch >= write_batch_num:
+                            f.write(write_batch_str)
+                            f.flush()
+                            write_batch_str = ""
+                            current_write_batch = 0
+
+                        batch_found += 1
+                        num_found += 1
+
+                        # Stop early if we've found enough samples
+                        if num_found >= num:
+                            # Cancel remaining futures to avoid unnecessary work
+                            for remaining_future in futures:
+                                if not remaining_future.done():
+                                    remaining_future.cancel()
+
+                            # flush any remaining write batch
+                            if write_batch_str != "":
+                                f.write(write_batch_str)
+                                f.flush()
+                            break
+
+            print(
+                f"Batch complete: found {batch_found} new samples. Total: {num_found}/{num}"
+            )
+
+            # Break if we've found enough samples
+            if num_found >= num:
+                break
+
+    print(
+        f"Generation {generation} complete: {num_found} improved samples saved to {out_path}"
+    )
+
+
+def train_one_batch(
+    model,
+    optimizer,
+    scheduler,
+    batch_loader,
+    out_path,
+    sample_step,
+    generation,
+    args,
+    total_batches,
+    best_loss,
+    step,
+):
+    t0 = time.time()
+    # get the next batch, ship to device, and unpack it to input and target
+    batch = batch_loader.next()
+    batch = [t.to(args.device) for t in batch]
+    X, Y = batch
+
+    # print(f"X.shape {X.shape} Y.shape {Y.shape}")
+    # print(f"X[0,:] {X[0,:]}")
+    # print(f"Y[0,:] {Y[0,:]}")  # print the first row of X and Y
+
+    # feed into the model
+    logits, loss = model(X, Y)
+
+    # calculate the gradient, update the weights
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    # wait for all CUDA work on the GPU to finish then calculate iteration time taken
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize()
+    t1 = time.time()
+
+    # logging
+    if step % 10 == 0:
+        print(
+            f"step {step} | loss {loss.item():.4f} | step time {(t1 - t0) * 1000:.2f}ms | step lr {scheduler.get_last_lr()[0]:.2e}"
+        )
+
+    # evaluate the model
+    if step > 0 and step % 500 == 0:
+        train_loss, train_acc = evaluate(
+            model, train_dataset, batch_size=100, max_batches=10
+        )
+        test_loss, train_acc = evaluate(
+            model, test_dataset, batch_size=100, max_batches=10
+        )
+        writer.add_scalar("Loss/train", train_loss, step + generation * total_batches)
+        writer.add_scalar("Loss/test", test_loss, step + generation * total_batches)
+
+        writer.add_scalar(
+            "Accuracy/train", train_acc, step + generation * total_batches
+        )
+        writer.add_scalar("Accuracy/test", train_acc, step + generation * total_batches)
+
+        # accuracy
+
+        writer.flush()
+        print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
+        # save the model to disk if it has improved
+        if best_loss is None or test_loss < best_loss:
+            print(
+                f"test loss {test_loss} is the best so far, saving model to {out_path}"
+            )
+
+            # save the step count too
+            # make it atomic
+            state_dict = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "step": step,
+                "best_loss": best_loss,
+            }
+
+            # first generation, dont save generation number
+            if generation > 0:
+                state_dict["generation"] = generation
+
+            atomic_torch_save(
+                state_dict,
+                out_path,
+            )
+
+            best_loss = test_loss
+
+    # sample from the model
+    if step > 0 and step % sample_step == 0:
+        num_correct, num_samples = print_samples(num=10)
+        writer.add_scalar(
+            "Sampling/new_correct",
+            num_correct / num_samples,
+            step + generation * total_batches,
+        )
+
+    return best_loss
+
+
+def train_one_epoch(
+    model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args
+):
+    best_loss = None
+    step = 0
+    total_batches = batch_loader.train_loader.__len__()
+    print(f"Starting generation {generation} with {total_batches} batches")
+
+    while True:
+        try:
+            best_loss = train_one_batch(
+                model,
+                optimizer,
+                scheduler,
+                batch_loader,
+                out_path,
+                sample_step,
+                generation,
+                args,
+                total_batches,
+                best_loss,
+                step,
+            )
+            step += 1
+        except Exception as e:
+            print("Exception during training:")
+            print(e)
+            print("Continuing to next batch...")
+
+        if step >= total_batches:
+            print("End of epoch")
+            break
+
+        # termination conditions
 
 
 @torch.inference_mode()
@@ -355,109 +507,19 @@ def evaluate(model, dataset, batch_size=50, max_batches=None):
 
 
 # -----------------------------------------------------------------------------
-# helper functions for creating the training and test Datasets that emit words
-
-
-class CharDataset(Dataset):
-    def __init__(self, words, chars, max_word_length):
-        self.words = words
-        self.chars = chars
-        self.max_word_length = max_word_length
-        self.stoi = {ch: i + 1 for i, ch in enumerate(chars)}
-        self.itos = {i: s for s, i in self.stoi.items()}  # inverse mapping
-
-    def __len__(self):
-        return len(self.words)
-
-    def contains(self, word):
-        return word in self.words
-
-    def get_vocab_size(self):
-        return len(self.chars) + 1  # all the possible characters and special 0 token
-
-    def get_output_length(self):
-        return self.max_word_length + 1  # <START> token followed by words
-
-    def encode(self, word):
-        ix = torch.tensor([self.stoi[w] for w in word], dtype=torch.long)
-        return ix
-
-    def decode(self, ix):
-        word = "".join(self.itos[i] for i in ix)
-        return word
-
-    def __getitem__(self, idx):
-        word = self.words[idx]
-        ix = self.encode(word)
-        x = torch.zeros(self.max_word_length + 1, dtype=torch.long)
-        y = torch.zeros(self.max_word_length + 1, dtype=torch.long)
-        x[1 : 1 + len(ix)] = ix
-        y[: len(ix)] = ix
-        y[len(ix) + 1 :] = -1  # index -1 will mask the loss at the inactive locations
-        return x, y
-
-
-def create_datasets(input_file):
-    # preprocessing of the input text file
-    with open(input_file, "r") as f:
-        data = f.read()
-    words = data.splitlines()
-    words = [w.strip() for w in words]  # get rid of any leading or trailing white space
-    words = [w for w in words if w]  # get rid of any empty strings
-    chars = sorted(list(set("".join(words))))  # all the possible characters
-    max_word_length = max(len(w) for w in words)
-    print(f"number of examples in the dataset: {len(words)}")
-    print(f"max word length: {max_word_length}")
-    print(f"number of unique characters in the vocabulary: {len(chars)}")
-    print("vocabulary:")
-    print("".join(chars))
-
-    # partition the input data into a training and the test set
-    test_set_size = min(
-        1000, int(len(words) * 0.1)
-    )  # 10% of the training set, or up to 1000 examples
-    rp = torch.randperm(len(words)).tolist()
-    train_words = [words[i] for i in rp[:-test_set_size]]
-    test_words = [words[i] for i in rp[-test_set_size:]]
-    print(
-        f"split up the dataset into {len(train_words)} training examples and {len(test_words)} test examples"
-    )
-
-    # wrap in dataset objects
-    train_dataset = CharDataset(train_words, chars, max_word_length)
-    test_dataset = CharDataset(test_words, chars, max_word_length)
-
-    return train_dataset, test_dataset
-
-
-class InfiniteDataLoader:
-    """
-    this is really hacky and I'm not proud of it, but there doesn't seem to be
-    a better way in PyTorch to just create an infinite dataloader?
-    """
-
-    def __init__(self, dataset, **kwargs):
-        train_sampler = torch.utils.data.RandomSampler(
-            dataset, replacement=True, num_samples=int(1e10)
-        )
-        self.train_loader = DataLoader(dataset, sampler=train_sampler, **kwargs)
-        self.data_iter = iter(self.train_loader)
-
-    def next(self):
-        try:
-            batch = next(self.data_iter)
-        except StopIteration:  # this will technically only happen after 1e10 samples... (i.e. basically never)
-            self.data_iter = iter(self.train_loader)
-            batch = next(self.data_iter)
-        return batch
-
-
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    sample_step = 100
+    # number of times to
+    # train the model to max iters
+    # get 10000 samples from the model that
+    # 1 - are valid sequences
+    # 2 - correctly computes index k
+    # 3 - can be improved by local search
+    # we collect 10000 such samples every boost iteration
+
+    max_pattern_boost_steps = 30
 
     # parse command line args
-    parser = argparse.ArgumentParser(description="Make More")
+    parser = argparse.ArgumentParser(description="Learning Atiyah Conjecture")
     # system/input/output
     parser.add_argument(
         "--input-file",
@@ -486,16 +548,11 @@ if __name__ == "__main__":
         default=4,
         help="number of data workers for both train/test",
     )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=-1,
-        help="max number of optimization steps to run for, or -1 for infinite.",
-    )
+
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
+        default="mps",
         help="device to use for compute, examples: cpu|cuda|cuda:2|mps",
     )
     parser.add_argument("--seed", type=int, default=3407, help="seed")
@@ -515,18 +572,15 @@ if __name__ == "__main__":
     parser.add_argument("--block-size", type=int, help="block size of training data")
 
     # model
-    parser.add_argument("--n-layer", type=int, default=4, help="number of layers")
+    parser.add_argument("--n-layer", type=int, default=8, help="number of layers")
     parser.add_argument(
         "--n-head", type=int, default=4, help="number of heads (in a transformer)"
     )
     parser.add_argument(
-        "--n-embd", type=int, default=64, help="number of feature channels in the model"
-    )
-    parser.add_argument(
-        "--n-embd2",
+        "--n-embd",
         type=int,
-        default=64,
-        help="number of feature channels elsewhere in the model",
+        default=144,
+        help="number of feature channels in the model",
     )
 
     # optimization
@@ -534,14 +588,14 @@ if __name__ == "__main__":
         "--batch-size",
         "-b",
         type=int,
-        default=32,
+        default=256,
         help="batch size during optimization",
     )
     parser.add_argument(
-        "--learning-rate", "-l", type=float, default=5e-4, help="learning rate"
+        "--learning-rate", "-l", type=float, default=1e-4, help="learning rate"
     )
     parser.add_argument(
-        "--weight-decay", "-w", type=float, default=0.01, help="weight decay"
+        "--weight-decay", "-w", type=float, default=0.001, help="weight decay"
     )
     args = parser.parse_args()
     print(vars(args))
@@ -562,6 +616,24 @@ if __name__ == "__main__":
 
     out_path = os.path.join(run_dir, "model.pt")
 
+    loaded = None
+    starting_generation = 0
+
+    # first determine the generation
+    if (
+        args.resume or args.sample_only
+    ):  # note: if we sample-only then we also assume we are resuming
+        assert os.path.exists(out_path), (
+            f"could not find model file {out_path}, expected a model.pt in the workdir"
+        )
+        print(f"resuming from existing model in the workdir {out_path}")
+        loaded = torch.load(out_path, map_location=args.device)
+        starting_generation = loaded.get("generation", 0)
+
+    if args.sample_only:
+        print_samples(num=args.num_samples)
+        sys.exit()
+
     writer = SummaryWriter(log_dir=run_dir, comment=f"makemore run-{timestamp}")
 
     # only load the datateset in train mode
@@ -570,10 +642,32 @@ if __name__ == "__main__":
         vocab_size = args.vocab_size
     else:
         # init datasets
-        train_dataset, test_dataset = create_datasets(args.input_file)
+        if starting_generation == 0:
+            print("loading initial dataset")
+            train_dataset, test_dataset = create_datasets(args.input_file)
+        else:
+            # load all the data_generation-*.txt files up to and including starting_generation
+            generation_zero = args.input_file
+            all_other_data_files = []
+            for gen in range(1, starting_generation + 1):
+                gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
+                assert os.path.exists(gen_file), (
+                    f"could not find expected dataset file {gen_file}"
+                )
+                all_other_data_files.append(gen_file)
+            print(
+                f"loading fused dataset from {len(all_other_data_files)} files, up to generation {starting_generation}"
+            )
+            # load the fused dataset
+            train_dataset, test_dataset = create_fused_int_datasets(
+                generation_zero, all_other_data_files
+            )
+
         vocab_size = train_dataset.get_vocab_size()
         block_size = train_dataset.get_output_length()
         print(f"dataset determined that: {vocab_size=}, {block_size=}")
+
+    assert args.n_embd > 64
 
     # init model
     config = ModelConfig(
@@ -582,14 +676,16 @@ if __name__ == "__main__":
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
+        dropout=0.0,
     )
 
     model = Transformer(config)
+    # model = torch.compile(model)
     model.to(args.device)
 
+    # compile model
+
     batch_size = args.batch_size
-    best_loss = None
-    step = 0
 
     # init optimizer
     optimizer = torch.optim.AdamW(
@@ -600,8 +696,10 @@ if __name__ == "__main__":
         eps=1e-8,
     )
 
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_lambda)
+
     # init dataloader
-    batch_loader = InfiniteDataLoader(
+    batch_loader = StreamDataLoader(
         train_dataset,
         batch_size=batch_size,
         pin_memory=True,
@@ -609,15 +707,10 @@ if __name__ == "__main__":
     )
 
     print(f"model #params: {sum(p.numel() for p in model.parameters())}")
-    if (
-        args.resume or args.sample_only
-    ):  # note: if we sample-only then we also assume we are resuming
-        assert os.path.exists(out_path), (
-            f"could not find model file {out_path}, expected a model.pt in the workdir"
-        )
-        print(f"resuming from existing model in the workdir {out_path}")
-        loaded = torch.load(out_path, map_location=args.device)
 
+    # if there is a loaded model, load it
+    if loaded is not None:
+        print(f"resuming from existing model in the workdir {out_path}")
         print("loaded keys:", loaded.keys())
 
         model.load_state_dict(loaded["model_state_dict"])
@@ -630,78 +723,48 @@ if __name__ == "__main__":
         sys.exit()
 
     # training loop
-    while True:
-        t0 = time.time()
+    do_generation = False
 
-        # get the next batch, ship to device, and unpack it to input and target
-        batch = batch_loader.next()
-        batch = [t.to(args.device) for t in batch]
-        X, Y = batch
+    for generation in range(starting_generation, max_pattern_boost_steps):
+        train_one_epoch(
+            model,
+            optimizer,
+            scheduler,
+            batch_loader,
+            out_path,
+            sample_step=500,
+            generation=generation,
+            args=args,
+        )
 
-        # feed into the model
-        logits, loss = model(X, Y)
+        print(f"finished generation {generation}, generating new samples")
 
-        # calculate the gradient, update the weights
-        model.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        # set model to
+        # save in generation+1, since we take initial dataset as generation 0
+        if do_generation:
+            model.eval()
+            generate_n_improved_samples(num=1000, generation=generation + 1)
 
-        # wait for all CUDA work on the GPU to finish then calculate iteration time taken
-        if args.device.startswith("cuda"):
-            torch.cuda.synchronize()
-        t1 = time.time()
+            # rebuild the dataloaders with the new data
+            all_other_data_files = []
 
-        # logging
-        if step % 10 == 0:
+            for gen in range(1, generation + 2):
+                gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
+                if os.path.exists(gen_file):
+                    all_other_data_files.append(gen_file)
+
             print(
-                f"step {step} | loss {loss.item():.4f} | step time {(t1 - t0) * 1000:.2f}ms"
+                f"loading fused dataset from {len(all_other_data_files)} files, up to generation {generation + 1}"
             )
+            generation_zero = args.input_file
 
-        # evaluate the model
-        if step > 0 and step % 500 == 0:
-            train_loss, train_acc = evaluate(
-                model, train_dataset, batch_size=100, max_batches=10
+            train_dataset, test_dataset = create_fused_int_datasets(
+                generation_zero, all_other_data_files
             )
-            test_loss, train_acc = evaluate(
-                model, test_dataset, batch_size=100, max_batches=10
+            batch_loader = StreamDataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                pin_memory=True,
+                num_workers=args.num_workers,
             )
-            writer.add_scalar("Loss/train", train_loss, step)
-            writer.add_scalar("Loss/test", test_loss, step)
-
-            writer.add_scalar("Accuracy/train", train_acc, step)
-            writer.add_scalar("Accuracy/test", train_acc, step)
-
-            # accuracy
-
-            writer.flush()
-            print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
-            # save the model to disk if it has improved
-            if best_loss is None or test_loss < best_loss:
-                print(
-                    f"test loss {test_loss} is the best so far, saving model to {out_path}"
-                )
-
-                # save the step count too
-                # make it atomic
-
-                atomic_torch_save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "step": step,
-                        "best_loss": best_loss,
-                    },
-                    out_path,
-                )
-
-                best_loss = test_loss
-
-        # sample from the model
-        if step > 0 and step % sample_step == 0:
-            num_correct, num_samples = print_samples(num=10)
-            writer.add_scalar("Sampling/new_correct", num_correct / num_samples, step)
-
-        step += 1
-        # termination conditions
-        if args.max_steps >= 0 and step >= args.max_steps:
-            break
+            model.train()
