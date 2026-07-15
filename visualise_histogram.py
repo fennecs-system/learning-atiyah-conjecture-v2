@@ -1,4 +1,5 @@
-from utils import decode, compute_max_dot
+from tokenizer import decode
+from utils import compute_max_dot
 # load every data_generation-*.txt file in argument directory
 
 # apply the decode function from makemore.py to each line

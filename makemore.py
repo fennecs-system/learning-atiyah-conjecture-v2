@@ -1,17 +1,9 @@
 """
-Forked from https://github.com/karpathy/makemore
-
-you give this script some words (one per line) and it will generate more things like it.
-uses super state of the art Transformer AI tech
-this code is intended to be super hackable. tune it to your needs.
-
-Changes from minGPT:
-- I removed the from_pretrained function where we init with GPT2 weights
-- I removed dropout layers because the models we train here are small,
-  it's not necessary to understand at this stage and at this scale.
-- I removed weight decay and all of the complexity around what parameters are
-  and are not weight decayed. I don't believe this should make a massive
-  difference at the scale that we operate on here.
+PatternBoost loop for the Atiyah conjecture point-configuration search: a
+small Transformer (adapted from Karpathy's minGPT/makemore) is trained on
+tokenised (v, p, k) triples, then repeatedly used to generate new candidate
+configurations that are refined with local search (utils.local_search) and
+fed back in as the next generation's training data.
 """
 
 import os
@@ -20,17 +12,11 @@ import time
 import argparse
 from dataclasses import dataclass
 from itertools import takewhile
-import gc
 
-from utils import decode_and_check, local_search, compute_max_dot, encode
-import time
-
-from typing import Optional, Tuple
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from tokenizer import encode
+from utils import decode_and_check, local_search, compute_max_dot
 
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -103,6 +89,14 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
     return idx
 
 
+def _crop_and_decode(row, dataset):
+    """row is a sampled sequence (as a python list) with the leading <START>
+    token already cropped out; crop it again at the first <STOP> (id 0) and
+    decode it back into a comma-separated token string."""
+    crop_index = row.index(0) if 0 in row else len(row)
+    return dataset.decode(row[:crop_index])
+
+
 def print_samples(num=10):
     """samples from the model and pretty prints the decoded samples"""
     X_init = torch.zeros(num, 1, dtype=torch.long).to(args.device)
@@ -117,10 +111,7 @@ def print_samples(num=10):
         row = X_samp[
             i, 1:
         ].tolist()  # note: we need to crop out the first <START> token
-        # token 0 is the <STOP> token, so we crop the output sequence at that point
-        crop_index = row.index(0) if 0 in row else len(row)
-        row = row[:crop_index]
-        word_samp = train_dataset.decode(row)
+        word_samp = _crop_and_decode(row, train_dataset)
         # separately track samples that we have and have not seen before
         if train_dataset.contains(word_samp):
             train_samples.append(word_samp)
@@ -161,8 +152,7 @@ def print_samples(num=10):
 
 # a sample must be grammatically correct
 def check_sample_valid(word):
-    # 4 points, in R^2
-    n = 4
+    n = args.n_points
     dim = 2
 
     try:
@@ -200,10 +190,7 @@ def check_sample_valid(word):
         # k should be a valid index
         assert k >= 0 and k < len(v)
 
-        # assert k should be 1 x 4
         assert v.shape == (n,)
-        # p should be 4 x 2
-        # two points in 2D for each of the 4 vertices
         assert p.shape == (n, dim)
 
         return v, p, k
@@ -212,62 +199,19 @@ def check_sample_valid(word):
 
 
 def generate_n_improved_samples(num=1000, generation=1):
-    def process_sample(i: int, X_samp) -> Optional[Tuple[int, str]]:
-        """Process a single sample and return result if valid improvement found."""
-        try:
-            # get the i'th row of sampled integers, as python list
-            row = X_samp[
-                i, 1:
-            ].tolist()  # note: we need to crop out the first <START> token
-            # token 0 is the <STOP> token, so we crop the output sequence at that point
-            crop_index = row.index(0) if 0 in row else len(row)
-            row = row[:crop_index]
-            word_samp = train_dataset.decode(row)
-
-            # separately track samples that we have and have not seen before
-            if train_dataset.contains(word_samp):
-                return None
-            elif test_dataset.contains(word_samp):
-                return None
-            else:
-                # its not in the dataset
-                try:
-                    v, p, k = check_sample_valid(word_samp)
-                    found_better, candidates = local_search(v, p, k, 10)
-                    improved_p = candidates[0][1]
-                    _, new_k_eval = compute_max_dot(v, improved_p)
-
-                    if found_better:
-                        tokens = encode(v, improved_p, new_k_eval)
-                        tokens_str = ",".join([str(x) for x in tokens]) + "\n"
-
-                        # Thread-safe file writing
-                        print(f"Found improved sample {tokens}")
-
-                        return (i, tokens_str)
-
-                except Exception as e:
-                    return None
-
-        except Exception as e:
-            return None
-
-        return None
-
-    # generate 100 samples at a time
-    # keep the ones that are valid and can be improved by local search
-    # and are not already in the train or test set
-    # repeat until we have num such samples
+    """Sample candidates from the model, keep the ones that are valid,
+    correctly compute k, and are novel (not already in train/test), then run
+    local search on each to find nearby configurations with a smaller max
+    |dot|. Repeat until `num` improved samples have been collected."""
     num_found = 0
     out_path = os.path.join(run_dir, f"data_generation-{generation}.txt")
 
     write_batch_num = 10
     current_write_batch = 0
+    write_batch_str = ""
 
     with open(out_path, "w") as f:
         while num_found < num:
-            write_batch_str = ""
-
             # seed 100 random samples
             X_init = torch.zeros(100, 1, dtype=torch.long).to(args.device)
             top_k = args.top_k if args.top_k != -1 else None
@@ -278,55 +222,60 @@ def generate_n_improved_samples(num=1000, generation=1):
                 "cpu"
             )
 
-            # Process samples in parallel with 10 workers
+            # cheap, per-sample grammar/novelty filtering
+            candidates = []
+            for i in range(X_samp.size(0)):
+                row = X_samp[i, 1:].tolist()
+                word_samp = _crop_and_decode(row, train_dataset)
+
+                if train_dataset.contains(word_samp) or test_dataset.contains(
+                    word_samp
+                ):
+                    continue
+
+                valid = check_sample_valid(word_samp)
+                if valid is not None:
+                    candidates.append(valid)
+
+            # the expensive part: local search, now vectorized internally
+            # (see utils.local_search), so a plain loop over candidates is
+            # fine -- no thread/process pool needed
             batch_found = 0
-            max_workers = 100
+            for v, p, k in candidates:
+                try:
+                    found_better, results = local_search(v, p, k, 10)
+                except Exception:
+                    continue
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks for this batch
-                futures = {
-                    executor.submit(process_sample, i, X_samp): i
-                    for i in range(X_samp.size(0))
-                }
+                if not found_better:
+                    continue
 
-                # Process completed tasks
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result is not None:
-                        i, tokens_str = result
+                improved_p = results[0][1]
+                _, new_k_eval = compute_max_dot(v, improved_p)
+                tokens = encode(v, improved_p, new_k_eval)
+                print(f"Found improved sample {tokens}")
 
-                        write_batch_str += tokens_str
-                        current_write_batch += 1
+                write_batch_str += ",".join(str(x) for x in tokens) + "\n"
+                current_write_batch += 1
+                batch_found += 1
+                num_found += 1
 
-                        if current_write_batch >= write_batch_num:
-                            f.write(write_batch_str)
-                            f.flush()
-                            write_batch_str = ""
-                            current_write_batch = 0
+                if current_write_batch >= write_batch_num:
+                    f.write(write_batch_str)
+                    f.flush()
+                    write_batch_str = ""
+                    current_write_batch = 0
 
-                        batch_found += 1
-                        num_found += 1
-
-                        # Stop early if we've found enough samples
-                        if num_found >= num:
-                            # Cancel remaining futures to avoid unnecessary work
-                            for remaining_future in futures:
-                                if not remaining_future.done():
-                                    remaining_future.cancel()
-
-                            # flush any remaining write batch
-                            if write_batch_str != "":
-                                f.write(write_batch_str)
-                                f.flush()
-                            break
+                if num_found >= num:
+                    break
 
             print(
                 f"Batch complete: found {batch_found} new samples. Total: {num_found}/{num}"
             )
 
-            # Break if we've found enough samples
-            if num_found >= num:
-                break
+        if write_batch_str:
+            f.write(write_batch_str)
+            f.flush()
 
     print(
         f"Generation {generation} complete: {num_found} improved samples saved to {out_path}"
@@ -405,6 +354,12 @@ def train_one_batch(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "step": step,
                 "best_loss": best_loss,
+                "vocab_size": vocab_size,
+                "block_size": block_size,
+                "n_layer": args.n_layer,
+                "n_head": args.n_head,
+                "n_embd": args.n_embd,
+                "n_points": args.n_points,
             }
 
             # first generation, dont save generation number
@@ -427,39 +382,32 @@ def train_one_batch(
             step + generation * total_batches,
         )
 
+    return best_loss
+
 
 def train_one_epoch(
     model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args
 ):
     best_loss = None
-    step = 0
     total_batches = batch_loader.train_loader.__len__()
     print(f"Starting generation {generation} with {total_batches} batches")
 
-    while True:
-        try:
-            train_one_batch(
-                model,
-                optimizer,
-                scheduler,
-                batch_loader,
-                out_path,
-                sample_step,
-                generation,
-                args,
-                total_batches,
-                best_loss,
-                step,
-            )
-            step += 1
-        except Exception as e:
-            print(e)
+    for step in range(total_batches):
+        best_loss = train_one_batch(
+            model,
+            optimizer,
+            scheduler,
+            batch_loader,
+            out_path,
+            sample_step,
+            generation,
+            args,
+            total_batches,
+            best_loss,
+            step,
+        )
 
-        if step >= total_batches:
-            print("End of epoch")
-            break
-
-        # termination conditions
+    print("End of epoch")
 
 
 @torch.inference_mode()
@@ -554,8 +502,12 @@ if __name__ == "__main__":
         help="number of samples to generate when using --sample-only",
     )
 
-    parser.add_argument("--vocab-size", type=int, help="vocab size of training data")
-    parser.add_argument("--block-size", type=int, help="block size of training data")
+    parser.add_argument(
+        "--n-points",
+        type=int,
+        default=4,
+        help="number of points per configuration (must match the data)",
+    )
 
     # model
     parser.add_argument("--n-layer", type=int, default=4, help="number of layers")
@@ -564,12 +516,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--n-embd", type=int, default=64, help="number of feature channels in the model"
-    )
-    parser.add_argument(
-        "--n-embd2",
-        type=int,
-        default=64,
-        help="number of feature channels elsewhere in the model",
     )
 
     # optimization
@@ -619,21 +565,28 @@ if __name__ == "__main__":
         loaded = torch.load(out_path, map_location=args.device)
         starting_generation = loaded.get("generation", 0)
 
-    if args.sample_only:
-        print_samples(num=args.num_samples)
-        sys.exit()
+        # the loaded checkpoint is authoritative for anything that defines the
+        # model's shape -- passing mismatched values on the CLI would just
+        # break loading, so always trust the checkpoint here
+        args.n_layer = loaded.get("n_layer", args.n_layer)
+        args.n_head = loaded.get("n_head", args.n_head)
+        args.n_embd = loaded.get("n_embd", args.n_embd)
+        args.n_points = loaded.get("n_points", args.n_points)
 
     writer = SummaryWriter(log_dir=run_dir, comment=f"makemore run-{timestamp}")
 
-    # only load the datateset in train mode
+    # only load the dataset in train mode; --sample-only gets vocab/block
+    # size from the checkpoint instead
     if args.sample_only:
-        block_size = args.block_size
-        vocab_size = args.vocab_size
+        vocab_size = loaded["vocab_size"]
+        block_size = loaded["block_size"]
     else:
         # init datasets
         if starting_generation == 0:
             print("loading initial dataset")
-            train_dataset, test_dataset = create_datasets(args.input_file)
+            train_dataset, test_dataset = create_datasets(
+                args.input_file, n_points=args.n_points, seed=args.seed
+            )
         else:
             # load all the data_generation-*.txt files up to and including starting_generation
             generation_zero = args.input_file
@@ -649,7 +602,10 @@ if __name__ == "__main__":
             )
             # load the fused dataset
             train_dataset, test_dataset = create_fused_datasets(
-                generation_zero, all_other_data_files
+                generation_zero,
+                all_other_data_files,
+                n_points=args.n_points,
+                seed=args.seed,
             )
 
         vocab_size = train_dataset.get_vocab_size()
@@ -743,7 +699,10 @@ if __name__ == "__main__":
         generation_zero = args.input_file
 
         train_dataset, test_dataset = create_fused_datasets(
-            generation_zero, all_other_data_files
+            generation_zero,
+            all_other_data_files,
+            n_points=args.n_points,
+            seed=args.seed,
         )
         batch_loader = StreamDataLoader(
             train_dataset,

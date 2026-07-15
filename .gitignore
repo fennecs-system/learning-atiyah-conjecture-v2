@@ -8,3 +8,4 @@ __pycache__/
 woof/
 out/
 .ruff_cache/
+main.tex

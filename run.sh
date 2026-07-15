@@ -1,2 +1,2 @@
-python makemore.py --type transformer --input-file data.txt -b 64
+python makemore.py --input-file data.txt -b 64
 

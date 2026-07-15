@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
-from utils import decode
+from tokenizer import decode
 
 
 def convex_hull_2d(points):
