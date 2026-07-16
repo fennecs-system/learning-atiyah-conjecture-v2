@@ -22,7 +22,7 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from model import Transformer
-from dataset_utils import create_datasets, create_fused_datasets, StreamDataLoader
+from dataset_utils import create_datasets, StreamDataLoader
 
 # -----------------------------------------------------------------------------
 
@@ -291,7 +291,7 @@ def train_one_batch(
     sample_step,
     generation,
     args,
-    total_batches,
+    num_steps,
     best_loss,
     step,
 ):
@@ -329,13 +329,13 @@ def train_one_batch(
         test_loss, train_acc = evaluate(
             model, test_dataset, batch_size=100, max_batches=10
         )
-        writer.add_scalar("Loss/train", train_loss, step + generation * total_batches)
-        writer.add_scalar("Loss/test", test_loss, step + generation * total_batches)
+        writer.add_scalar("Loss/train", train_loss, step + generation * num_steps)
+        writer.add_scalar("Loss/test", test_loss, step + generation * num_steps)
 
         writer.add_scalar(
-            "Accuracy/train", train_acc, step + generation * total_batches
+            "Accuracy/train", train_acc, step + generation * num_steps
         )
-        writer.add_scalar("Accuracy/test", train_acc, step + generation * total_batches)
+        writer.add_scalar("Accuracy/test", train_acc, step + generation * num_steps)
 
         # accuracy
 
@@ -379,20 +379,27 @@ def train_one_batch(
         writer.add_scalar(
             "Sampling/new_correct",
             num_correct / num_samples,
-            step + generation * total_batches,
+            step + generation * num_steps,
         )
 
     return best_loss
 
 
 def train_one_epoch(
-    model, optimizer, scheduler, batch_loader, out_path, sample_step, generation, args
+    model,
+    optimizer,
+    scheduler,
+    batch_loader,
+    out_path,
+    sample_step,
+    generation,
+    args,
+    num_steps,
 ):
     best_loss = None
-    total_batches = batch_loader.train_loader.__len__()
-    print(f"Starting generation {generation} with {total_batches} batches")
+    print(f"Starting generation {generation} with {num_steps} steps")
 
-    for step in range(total_batches):
+    for step in range(num_steps):
         best_loss = train_one_batch(
             model,
             optimizer,
@@ -402,7 +409,7 @@ def train_one_epoch(
             sample_step,
             generation,
             args,
-            total_batches,
+            num_steps,
             best_loss,
             step,
         )
@@ -532,6 +539,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight-decay", "-w", type=float, default=0.01, help="weight decay"
     )
+    parser.add_argument(
+        "--steps-per-generation",
+        type=int,
+        default=15_000,
+        help="number of gradient steps to train for in each pattern-boost "
+        "generation, decoupled from how many examples are in that "
+        "generation's dataset (the PatternBoost paper trains ~15k steps "
+        "even on its simplest problem)",
+    )
     args = parser.parse_args()
     print(vars(args))
 
@@ -588,24 +604,19 @@ if __name__ == "__main__":
                 args.input_file, n_points=args.n_points, seed=args.seed
             )
         else:
-            # load all the data_generation-*.txt files up to and including starting_generation
-            generation_zero = args.input_file
-            all_other_data_files = []
-            for gen in range(1, starting_generation + 1):
-                gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
-                assert os.path.exists(gen_file), (
-                    f"could not find expected dataset file {gen_file}"
-                )
-                all_other_data_files.append(gen_file)
-            print(
-                f"loading fused dataset from {len(all_other_data_files)} files, up to generation {starting_generation}"
+            # only train on the latest generation's samples -- older
+            # data_generation-*.txt files stay on disk under run_dir for
+            # history/visualisation (see visualise_histogram.py), but
+            # aren't fed back into training
+            latest_gen_file = os.path.join(
+                run_dir, f"data_generation-{starting_generation}.txt"
             )
-            # load the fused dataset
-            train_dataset, test_dataset = create_fused_datasets(
-                generation_zero,
-                all_other_data_files,
-                n_points=args.n_points,
-                seed=args.seed,
+            assert os.path.exists(latest_gen_file), (
+                f"could not find expected dataset file {latest_gen_file}"
+            )
+            print(f"loading dataset from generation {starting_generation}: {latest_gen_file}")
+            train_dataset, test_dataset = create_datasets(
+                latest_gen_file, n_points=args.n_points, seed=args.seed
             )
 
         vocab_size = train_dataset.get_vocab_size()
@@ -676,6 +687,7 @@ if __name__ == "__main__":
             sample_step=500,
             generation=generation,
             args=args,
+            num_steps=args.steps_per_generation,
         )
 
         print(f"finished generation {generation}, generating new samples")
@@ -685,24 +697,17 @@ if __name__ == "__main__":
         # save in generation+1, since we take initial dataset as generation 0
         generate_n_improved_samples(num=1000, generation=generation + 1)
 
-        # rebuild the dataloaders with the new data
-        all_other_data_files = []
-
-        for gen in range(1, generation + 2):
-            gen_file = os.path.join(run_dir, f"data_generation-{gen}.txt")
-            if os.path.exists(gen_file):
-                all_other_data_files.append(gen_file)
-
-        print(
-            f"loading fused dataset from {len(all_other_data_files)} files, up to generation {generation + 1}"
+        # only train on the latest generation's samples -- older
+        # data_generation-*.txt files stay on disk under run_dir for
+        # history/visualisation (see visualise_histogram.py), but aren't
+        # fed back into training
+        latest_gen_file = os.path.join(
+            run_dir, f"data_generation-{generation + 1}.txt"
         )
-        generation_zero = args.input_file
+        print(f"loading dataset from latest generation: {latest_gen_file}")
 
-        train_dataset, test_dataset = create_fused_datasets(
-            generation_zero,
-            all_other_data_files,
-            n_points=args.n_points,
-            seed=args.seed,
+        train_dataset, test_dataset = create_datasets(
+            latest_gen_file, n_points=args.n_points, seed=args.seed
         )
         batch_loader = StreamDataLoader(
             train_dataset,

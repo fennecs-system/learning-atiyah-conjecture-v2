@@ -108,15 +108,3 @@ def _build_datasets(lines: list[str], n_points: int, seed: int):
 def create_datasets(input_file: str, n_points: int = 4, seed: int = 0):
     lines = _load_lines(input_file)
     return _build_datasets(lines, n_points, seed)
-
-
-def create_fused_datasets(
-    seed_dataset_file: str,
-    additional_dataset_files: list[str],
-    n_points: int = 4,
-    seed: int = 0,
-):
-    lines = _load_lines(seed_dataset_file)
-    for path in additional_dataset_files:
-        lines += _load_lines(path)
-    return _build_datasets(lines, n_points, seed)

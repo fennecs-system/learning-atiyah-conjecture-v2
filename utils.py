@@ -49,6 +49,10 @@ def compute_dots(p: Tensor, v: Tensor) -> Tensor:
     coeffs = torch.ones(p.shape[:-2] + (n, 1), dtype=p.dtype, device=p.device)
     for k in range(n):
         coeffs = _poly_mul_step(coeffs, factor_a[..., :, k], factor_b[..., :, k])
+    # each rho_j's k==j step is an identity factor (1 + 0*z), which still
+    # pads the array by one column despite contributing nothing, so the
+    # loop leaves a spurious always-zero top coefficient; drop it.
+    coeffs = coeffs[..., :n]
     # coeffs: [..., n (index j), n (coefficient of z^c)]
 
     return torch.einsum("...jc,...c->...j", coeffs, v)
