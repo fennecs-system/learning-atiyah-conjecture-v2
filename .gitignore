@@ -9,3 +9,4 @@ woof/
 out/
 .ruff_cache/
 main.tex
+.venv
