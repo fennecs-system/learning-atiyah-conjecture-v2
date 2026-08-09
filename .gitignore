@@ -1,3 +1,4 @@
+.DS_Store
 .env/
 .env
 .env/*
@@ -7,3 +8,5 @@ __pycache__/
 woof/
 out/
 .ruff_cache/
+main.tex
+.venv
